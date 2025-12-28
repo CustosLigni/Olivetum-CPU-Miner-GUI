@@ -26,6 +26,20 @@ go build -o dist/olivetum-miner-gui .
 
 `ethminer` must be in the same directory as the GUI binary or available in `PATH`.
 
+## Build (Windows)
+
+Fyne uses GLFW (cgo), so you need a working C toolchain on Windows (MSYS2/MinGW or Visual Studio Build Tools).
+See the Fyne docs for platform-specific dependencies:
+https://developer.fyne.io/started/
+
+```powershell
+mkdir dist
+go mod tidy
+go build -ldflags="-H=windowsgui" -o dist\\OlivetumMiner.exe .
+```
+
+Place `ethminer.exe` next to `OlivetumMiner.exe` (or make sure it is in `PATH`).
+
 ## Getting `ethminer`
 
 This project is a GUI wrapper, it does not build `ethminer` from source.

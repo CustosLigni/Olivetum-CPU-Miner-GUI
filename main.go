@@ -1050,19 +1050,27 @@ func buildPoolURL(cfg *Config) (string, error) {
 }
 
 func findEthminer() (string, error) {
+	names := []string{"ethminer"}
+	if runtime.GOOS == "windows" {
+		names = []string{"ethminer.exe", "ethminer"}
+	}
 	exe, err := os.Executable()
 	if err == nil {
 		dir := filepath.Dir(exe)
-		candidate := filepath.Join(dir, "ethminer")
-		if st, err := os.Stat(candidate); err == nil && !st.IsDir() {
-			return candidate, nil
+		for _, name := range names {
+			candidate := filepath.Join(dir, name)
+			if st, err := os.Stat(candidate); err == nil && !st.IsDir() {
+				return candidate, nil
+			}
 		}
 	}
-	p, err := exec.LookPath("ethminer")
-	if err != nil {
-		return "", err
+	for _, name := range names {
+		p, err := exec.LookPath(name)
+		if err == nil {
+			return p, nil
+		}
 	}
-	return p, nil
+	return "", errors.New("ethminer not found")
 }
 
 var deviceLine = regexp.MustCompile(`^\s*(\d+)\s+(\S+)\s+\S+\s+(.+?)\s+(Yes|No)\s+`)
