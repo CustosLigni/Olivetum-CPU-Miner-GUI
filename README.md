@@ -19,11 +19,19 @@ A modern GUI wrapper for `ethminer` with Olivetumhash support. Built with Fyne.
 ## Build (binary)
 
 ```bash
+mkdir -p dist
 go mod tidy
 go build -o dist/olivetum-miner-gui .
 ```
 
 `ethminer` must be in the same directory as the GUI binary or available in `PATH`.
+
+## Getting `ethminer`
+
+This project is a GUI wrapper, it does not build `ethminer` from source.
+
+- Build `ethminer` from the Olivetum fork/repo, then point the GUI to it (same directory or `PATH`).
+- For AppImage packaging, provide the built `ethminer` path via `ETHMINER_SRC` (see below).
 
 ## Build (AppImage)
 
@@ -36,6 +44,15 @@ export ETHMINER_SRC=/path/to/ethminer
 
 The script downloads `appimagetool` if missing and produces:
 `dist/OlivetumMiner-x86_64.AppImage`
+
+## Run (AppImage)
+
+```bash
+chmod +x OlivetumMiner-x86_64.AppImage
+./OlivetumMiner-x86_64.AppImage
+```
+
+On some distros you may need FUSE (`libfuse2`/`fuse`) to run AppImages.
 
 ## Configuration
 
