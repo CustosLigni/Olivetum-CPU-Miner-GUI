@@ -347,7 +347,7 @@ func main() {
 		go func() {
 			backendSelection := selectedBackend()
 			backend := resolveBackend(ethminerPath, backendSelection)
-			list, err := listEthminerDevices(ethminerPath, backend)
+			list, out, err := listEthminerDevices(ethminerPath, backend)
 			if err != nil {
 				appendLog(fmt.Sprintf("[devices] %v\n", err))
 				fyne.Do(func() {
@@ -378,8 +378,11 @@ func main() {
 				if backend == backendCUDA {
 					backendName = "CUDA"
 				}
+				if strings.TrimSpace(out) != "" {
+					appendLog(fmt.Sprintf("[devices] %s --list-devices output:\n%s\n", backendName, strings.TrimSpace(out)))
+				}
 				newObjects = []fyne.CanvasObject{
-					widget.NewLabel(fmt.Sprintf("No %s devices found. Make sure drivers are installed.", backendName)),
+					widget.NewLabel(fmt.Sprintf("No %s devices found. If you use NVIDIA, pick CUDA. For AMD/Intel, install drivers with OpenCL support.", backendName)),
 				}
 			} else {
 				newObjects = make([]fyne.CanvasObject, 0, len(list))
@@ -1083,14 +1086,14 @@ func resolveBackend(ethminerPath string, backend string) string {
 	if ethminerPath == "" {
 		return backendOpenCL
 	}
-	list, err := listEthminerDevices(ethminerPath, backendCUDA)
+	list, _, err := listEthminerDevices(ethminerPath, backendCUDA)
 	if err == nil && len(list) > 0 {
 		return backendCUDA
 	}
 	return backendOpenCL
 }
 
-func listEthminerDevices(ethminerPath, backend string) ([]Device, error) {
+func listEthminerDevices(ethminerPath, backend string) ([]Device, string, error) {
 	args := []string{"--list-devices"}
 	if backend == backendCUDA {
 		args = append([]string{"-U"}, args...)
@@ -1101,11 +1104,12 @@ func listEthminerDevices(ethminerPath, backend string) ([]Device, error) {
 	configureChildProcess(cmd)
 	cmd.Env = append(os.Environ(), "LC_ALL=C")
 	out, err := cmd.CombinedOutput()
+	outStr := string(out)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list devices: %w\n%s", err, string(out))
+		return nil, outStr, fmt.Errorf("failed to list devices: %w\n%s", err, outStr)
 	}
 	var res []Device
-	sc := bufio.NewScanner(strings.NewReader(string(out)))
+	sc := bufio.NewScanner(strings.NewReader(outStr))
 	for sc.Scan() {
 		line := sc.Text()
 		m := deviceLine.FindStringSubmatch(line)
@@ -1120,9 +1124,9 @@ func listEthminerDevices(ethminerPath, backend string) ([]Device, error) {
 		})
 	}
 	if err := sc.Err(); err != nil {
-		return nil, err
+		return nil, outStr, err
 	}
-	return res, nil
+	return res, outStr, nil
 }
 
 func pickFreePort() (int, error) {
