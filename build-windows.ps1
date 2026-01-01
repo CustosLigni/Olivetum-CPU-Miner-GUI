@@ -12,7 +12,7 @@ New-Item -ItemType Directory -Force -Path $Dist | Out-Null
 Write-Host "[1/3] Building GUI..."
 Push-Location $Root
 go mod tidy
-go build -ldflags="-H=windowsgui" -o (Join-Path $Dist "OlivetumMiner.exe") .
+go build -trimpath -ldflags="-H=windowsgui -s -w" -o (Join-Path $Dist "OlivetumMiner.exe") .
 Pop-Location
 
 if ($EthminerSrc -ne "") {
@@ -36,4 +36,3 @@ if (Test-Path (Join-Path $Dist "ethminer.exe")) {
 
 Compress-Archive -Force -Path $Files -DestinationPath $ZipPath
 Write-Host "Done: $ZipPath"
-

@@ -29,7 +29,7 @@ fi
 echo "[1/4] Building GUI..."
 cd "${ROOT_DIR}"
 go mod tidy
-go build -o "${DIST_DIR}/olivetum-miner-gui" ./...
+go build -trimpath -ldflags="-s -w" -o "${DIST_DIR}/olivetum-miner-gui" ./...
 
 echo "[2/4] Building AppDir..."
 rm -rf "${APPDIR}"

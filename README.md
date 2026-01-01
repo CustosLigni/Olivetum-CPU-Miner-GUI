@@ -21,7 +21,7 @@ A modern GUI wrapper for `ethminer` with Olivetumhash support. Built with Fyne.
 ```bash
 mkdir -p dist
 go mod tidy
-go build -o dist/olivetum-miner-gui .
+go build -trimpath -ldflags="-s -w" -o dist/olivetum-miner-gui .
 ```
 
 `ethminer` must be in the same directory as the GUI binary or available in `PATH`.
@@ -35,10 +35,19 @@ https://developer.fyne.io/started/
 ```powershell
 mkdir dist
 go mod tidy
-go build -ldflags="-H=windowsgui" -o dist\\OlivetumMiner.exe .
+go build -trimpath -ldflags="-H=windowsgui -s -w" -o dist\\OlivetumMiner.exe .
 ```
 
 Place `ethminer.exe` next to `OlivetumMiner.exe` (or make sure it is in `PATH`).
+
+## Windows quick start (prebuilt)
+
+1. Download `OlivetumMiner-windows-x86_64.zip` from this repo (GitHub Actions artifact).
+2. Download `olivetum-ethminer-win64.zip` from `CustosLigni/Olivetum-GPU-Miner` (GitHub Actions artifact).
+3. Extract both ZIPs into the same folder so you have:
+   - `OlivetumMiner.exe`
+   - `ethminer.exe`
+4. Run `OlivetumMiner.exe`, select `GPU backend` (Auto / CUDA / OpenCL), then click `Start mining`.
 
 ## Getting `ethminer`
 
