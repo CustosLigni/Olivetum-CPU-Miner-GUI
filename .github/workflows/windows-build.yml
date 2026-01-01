@@ -37,18 +37,8 @@ jobs:
           go mod download
           go build -trimpath -ldflags="-H=windowsgui -s -w" -o dist/OlivetumMiner.exe .
 
-      - name: Package zip
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          $zip = Join-Path "dist" "OlivetumMiner-windows-x86_64.zip"
-          if (Test-Path $zip) { Remove-Item -Force $zip }
-          Compress-Archive -Force -Path (Join-Path "dist" "OlivetumMiner.exe") -DestinationPath $zip
-          Write-Host "Created: $zip"
-
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: OlivetumMiner-windows-x86_64
-          path: dist/OlivetumMiner-windows-x86_64.zip
+          path: dist/OlivetumMiner.exe
