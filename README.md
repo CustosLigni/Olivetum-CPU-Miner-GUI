@@ -43,7 +43,7 @@ Place `ethminer.exe` next to `OlivetumMiner.exe` (or make sure it is in `PATH`).
 ## Windows quick start (prebuilt)
 
 1. Download `OlivetumMiner-windows-x86_64.zip` from this repo (GitHub Actions artifact).
-2. Download `olivetum-ethminer-win64.zip` from `CustosLigni/Olivetum-GPU-Miner` (GitHub Actions artifact).
+2. Download `olivetum-ethminer-win64.zip` from the Olivetum ethminer fork repository (GitHub Actions artifact).
 3. Extract both ZIPs into the same folder so you have:
    - `OlivetumMiner.exe`
    - `ethminer.exe`

@@ -15,9 +15,11 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -35,7 +37,7 @@ const (
 	appName            = "Olivetum Miner"
 	configDirName      = "olivetum-miner-gui"
 	configFileName     = "config.json"
-	defaultStratumHost = "89.117.2.230"
+	defaultStratumHost = "pool.olivetumchain.org"
 	defaultStratumPort = 8008
 	defaultRPCURL      = "http://127.0.0.1:18545"
 
@@ -59,6 +61,7 @@ type Config struct {
 	SelectedDevices []int  `json:"selectedDevices"`
 	ReportHashrate  bool   `json:"reportHashrate"`
 	DisplayInterval int    `json:"displayInterval"`
+	HWMon           bool   `json:"hwMon"`
 }
 
 type Device struct {
@@ -76,6 +79,7 @@ type Stat struct {
 	Invalid      int64
 	PoolSwitches int64
 	PerGPU_KHs   []int64
+	PerGPU_Power []float64
 	Temps        []int
 	Fans         []int
 	Pool         string
@@ -94,7 +98,7 @@ func main() {
 	ethminerPath, ethminerErr := findEthminer()
 
 	modeLabels := []string{
-		"Pool (Stratum)",
+		"Solo Pool (Stratum)",
 		"Solo (Local RPC)",
 		"Solo (RPC gateway)",
 	}
@@ -179,6 +183,9 @@ func main() {
 	displayIntervalEntry.SetText(strconv.Itoa(cfg.DisplayInterval))
 	displayIntervalEntry.SetPlaceHolder("10")
 
+	hwmonCheck := widget.NewCheck("Enable hardware monitoring (temps/fans/power)", nil)
+	hwmonCheck.SetChecked(cfg.HWMon)
+
 	statusDot := canvas.NewCircle(theme.Color(theme.ColorNameDisabled))
 	statusDot.Resize(fyne.NewSize(10, 10))
 	statusDotHolder := container.NewVBox(
@@ -189,20 +196,85 @@ func main() {
 	statusValue := widget.NewLabelWithStyle("Stopped", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
 	statusValue.Wrapping = fyne.TextWrapOff
 
+	connectionBadgeLabel := widget.NewLabelWithStyle("Conn: Offline", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
+	connectionBadgeLabel.Wrapping = fyne.TextWrapOff
+	connectionBadgeBg := canvas.NewRectangle(theme.Color(theme.ColorNameDisabledButton))
+	connectionBadgeBg.StrokeColor = theme.Color(theme.ColorNameSeparator)
+	connectionBadgeBg.StrokeWidth = 1
+	connectionBadgeBg.CornerRadius = theme.Padding() * 2
+	connectionBadge := container.NewMax(
+		connectionBadgeBg,
+		container.NewPadded(container.NewCenter(connectionBadgeLabel)),
+	)
+	connOfflineColor := theme.Color(theme.ColorNameDisabledButton)
+	connConnectingColor := theme.Color(theme.ColorNameHover)
+	connLiveColor := theme.Color(theme.ColorNamePrimary)
+	setConnectionBadge := func(text string, fill color.Color) {
+		connectionBadgeLabel.SetText(text)
+		connectionBadgeBg.FillColor = fill
+		connectionBadgeBg.Refresh()
+	}
+
 	hashrateValue := canvas.NewText("—", theme.Color(theme.ColorNameForeground))
 	hashrateValue.Alignment = fyne.TextAlignLeading
 	hashrateValue.TextStyle = fyne.TextStyle{Bold: true}
 	hashrateValue.TextSize = theme.TextSize() * 2.6
+
+	setStatusDot := func(fill color.Color) {
+		statusDot.FillColor = fill
+		statusDot.Refresh()
+	}
+
+	setStatusText := func(text string) {
+		statusValue.SetText(text)
+	}
 
 	sharesValue := widget.NewLabel("—")
 	poolValue := widget.NewLabel("—")
 	poolValue.Wrapping = fyne.TextWrapWord
 	uptimeValue := widget.NewLabel("—")
 	backendInUseValue := widget.NewLabel("—")
+	sharesTile, sharesTileBg := metricTileWithIconBg("Shares", theme.ConfirmIcon(), sharesValue)
 	hashrateHistory := newHashrateChart(300) // ~10 minutes at 2s polling
 	avgHashrateValue := widget.NewLabelWithStyle("Avg —", fyne.TextAlignTrailing, fyne.TextStyle{Monospace: true})
 	avgHashrateValue.Wrapping = fyne.TextWrapOff
 	avgHashrateValue.Importance = widget.MediumImportance
+
+	blendColor := func(a, b color.NRGBA, t float32) color.NRGBA {
+		if t < 0 {
+			t = 0
+		}
+		if t > 1 {
+			t = 1
+		}
+		return color.NRGBA{
+			R: uint8(float32(a.R)*(1-t) + float32(b.R)*t),
+			G: uint8(float32(a.G)*(1-t) + float32(b.G)*t),
+			B: uint8(float32(a.B)*(1-t) + float32(b.B)*t),
+			A: 0xFF,
+		}
+	}
+
+	var sharesHighlight *fyne.Animation
+	highlightShares := func() {
+		if sharesTileBg == nil {
+			return
+		}
+		if sharesHighlight != nil {
+			sharesHighlight.Stop()
+		}
+		base := toNRGBA(theme.Color(theme.ColorNameInputBackground))
+		accent := toNRGBA(theme.Color(theme.ColorNamePrimary))
+		flash := blendColor(base, accent, 0.35)
+		sharesHighlight = canvas.NewColorRGBAAnimation(base, flash, canvas.DurationShort*2, func(c color.Color) {
+			sharesTileBg.FillColor = c
+			sharesTileBg.Refresh()
+		})
+		sharesHighlight.AutoReverse = true
+		sharesHighlight.RepeatCount = 0
+		sharesHighlight.Curve = fyne.AnimationEaseOut
+		sharesHighlight.Start()
+	}
 
 	modeHint := widget.NewLabel("")
 	modeHint.Wrapping = fyne.TextWrapWord
@@ -217,15 +289,25 @@ func main() {
 	backendResolvedHint.TextStyle = fyne.TextStyle{Italic: true}
 
 	devicesBox := container.NewVBox()
+	devicesActivity := widget.NewActivity()
+	devicesActivity.Hide()
+	devicesLoadingLabel := widget.NewLabel("Detecting GPUs...")
+	devicesLoadingRow := container.NewHBox(devicesActivity, devicesLoadingLabel)
 	var (
 		devMu        sync.Mutex
 		devices      []Device
 		deviceChecks []*widget.Check
 	)
+	deviceLabelByIndex := make(map[int]string)
 
 	logBuf := newRingLogs(5000)
 	followTailCheck := widget.NewCheck("Follow tail", nil)
 	followTailCheck.SetChecked(true)
+	var (
+		logSensorMu sync.RWMutex
+		logSensors  = make(map[int]deviceSensors)
+	)
+	var logsTabActive atomic.Bool
 
 	logList := widget.NewList(
 		func() int { return logBuf.Len() },
@@ -239,35 +321,273 @@ func main() {
 		},
 	)
 
+		type statsHeaderCell struct {
+			Label string
+			Icon  fyne.Resource
+		}
+		statsHeader := []statsHeaderCell{
+			{Label: "GPU"},
+			{Label: "Name"},
+			{Label: "Hashrate", Icon: iconHash},
+			{Label: "Temp", Icon: iconThermometer},
+			{Label: "Fan", Icon: iconFan},
+			{Label: "Power", Icon: iconBolt},
+		}
+		statsColWidths := []float32{60, 260, 130, 90, 90, 100}
+		statsHeaderHeight := theme.TextSize() * 1.8
+		statsHeaderRow := func() fyne.CanvasObject {
+			iconSize := theme.TextSize() * 1.1
+			cells := make([]fyne.CanvasObject, 0, len(statsHeader))
+			for i, cell := range statsHeader {
+				label := widget.NewLabelWithStyle(cell.Label, fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+				label.Wrapping = fyne.TextWrapOff
+				var content fyne.CanvasObject = label
+				if cell.Icon != nil {
+					icon := widget.NewIcon(cell.Icon)
+					content = container.NewHBox(container.NewGridWrap(fyne.NewSize(iconSize, iconSize), icon), label)
+				}
+				width := float32(120)
+				if i >= 0 && i < len(statsColWidths) {
+					width = statsColWidths[i]
+				}
+				cells = append(cells, fixedSize(fyne.NewSize(width, statsHeaderHeight), content))
+			}
+			return container.NewHBox(cells...)
+		}()
+	type statsRow struct {
+		Index    int
+		Name     string
+		Hashrate float64
+		Temp     int
+		Fan      int
+		Power    float64
+	}
+	var (
+		statsMu    sync.RWMutex
+		statsRows  []statsRow
+		lastStat   *Stat
+		lastStatMu sync.RWMutex
+	)
+
+		statsTable := widget.NewTable(
+			func() (int, int) {
+				statsMu.RLock()
+				defer statsMu.RUnlock()
+				return len(statsRows), len(statsHeader)
+			},
+			func() fyne.CanvasObject {
+				l := widget.NewLabel("")
+				l.Wrapping = fyne.TextWrapOff
+				return l
+			},
+			func(id widget.TableCellID, obj fyne.CanvasObject) {
+				text := obj.(*widget.Label)
+				text.Alignment = fyne.TextAlignLeading
+				text.TextStyle = fyne.TextStyle{}
+				row := id.Row
+				statsMu.RLock()
+				var data statsRow
+				if row >= 0 && row < len(statsRows) {
+					data = statsRows[row]
+			}
+			statsMu.RUnlock()
+
+			switch id.Col {
+			case 0:
+				text.SetText(fmt.Sprintf("#%d", data.Index))
+			case 1:
+				text.SetText(data.Name)
+			case 2:
+				text.Alignment = fyne.TextAlignTrailing
+				text.TextStyle = fyne.TextStyle{Monospace: true}
+				if data.Hashrate > 0 {
+					text.SetText(fmt.Sprintf("%.2f MH/s", data.Hashrate))
+				} else {
+					text.SetText("—")
+				}
+			case 3:
+				text.Alignment = fyne.TextAlignTrailing
+				text.TextStyle = fyne.TextStyle{Monospace: true}
+				if data.Temp > 0 {
+					text.SetText(fmt.Sprintf("%d°C", data.Temp))
+				} else {
+					text.SetText("—")
+				}
+			case 4:
+				text.Alignment = fyne.TextAlignTrailing
+				text.TextStyle = fyne.TextStyle{Monospace: true}
+				if data.Fan > 0 {
+					text.SetText(fmt.Sprintf("%d%%", data.Fan))
+				} else {
+					text.SetText("—")
+				}
+			case 5:
+				text.Alignment = fyne.TextAlignTrailing
+				text.TextStyle = fyne.TextStyle{Monospace: true}
+				if data.Power >= 0 {
+					text.SetText(fmt.Sprintf("%.0f W", data.Power))
+				} else {
+					text.SetText("—")
+				}
+			default:
+				text.SetText("")
+				}
+				text.Refresh()
+			},
+		)
+		for i, w := range statsColWidths {
+			statsTable.SetColumnWidth(i, w)
+		}
+
+	updateStatsTable := func(s Stat) {
+		devMu.Lock()
+		labelMap := make(map[int]string, len(deviceLabelByIndex))
+		maxIndex := -1
+		for idx, label := range deviceLabelByIndex {
+			labelMap[idx] = label
+			if idx > maxIndex {
+				maxIndex = idx
+			}
+		}
+		devMu.Unlock()
+
+		logSensorMu.RLock()
+		fallbackSensors := make(map[int]deviceSensors, len(logSensors))
+		for idx, sensor := range logSensors {
+			fallbackSensors[idx] = sensor
+			if idx > maxIndex {
+				maxIndex = idx
+			}
+		}
+		logSensorMu.RUnlock()
+
+		maxCount := len(s.PerGPU_KHs)
+		if len(s.Temps) > maxCount {
+			maxCount = len(s.Temps)
+		}
+		if len(s.Fans) > maxCount {
+			maxCount = len(s.Fans)
+		}
+		if len(s.PerGPU_Power) > maxCount {
+			maxCount = len(s.PerGPU_Power)
+		}
+		if maxIndex+1 > maxCount {
+			maxCount = maxIndex + 1
+		}
+		if maxCount < 0 {
+			maxCount = 0
+		}
+
+		rows := make([]statsRow, 0, maxCount)
+		for i := 0; i < maxCount; i++ {
+			name := labelMap[i]
+			if name == "" {
+				name = fmt.Sprintf("GPU %d", i)
+			}
+			hashrate := -1.0
+			if i < len(s.PerGPU_KHs) {
+				hashrate = float64(s.PerGPU_KHs[i]) / 1000.0
+			}
+			temp := 0
+			if i < len(s.Temps) && s.Temps[i] > 0 {
+				temp = s.Temps[i]
+			}
+			fan := 0
+			if i < len(s.Fans) && s.Fans[i] > 0 {
+				fan = s.Fans[i]
+			}
+			power := -1.0
+			if i < len(s.PerGPU_Power) && s.PerGPU_Power[i] >= 0 {
+				power = s.PerGPU_Power[i]
+			}
+			if fallback, ok := fallbackSensors[i]; ok {
+				if temp == 0 && fallback.Temp > 0 {
+					temp = fallback.Temp
+				}
+				if fan == 0 && fallback.Fan > 0 {
+					fan = fallback.Fan
+				}
+				if power < 0 && fallback.Power >= 0 {
+					power = fallback.Power
+				}
+			}
+			rows = append(rows, statsRow{
+				Index:    i,
+				Name:     name,
+				Hashrate: hashrate,
+				Temp:     temp,
+				Fan:      fan,
+				Power:    power,
+			})
+		}
+
+			sort.Slice(rows, func(i, j int) bool { return rows[i].Index < rows[j].Index })
+
+			statsMu.Lock()
+			statsRows = rows
+			statsMu.Unlock()
+			statsTable.Refresh()
+		}
+
+	refreshStatsTable := func() {
+		lastStatMu.RLock()
+		var snapshot Stat
+		if lastStat != nil {
+			snapshot = *lastStat
+		}
+		lastStatMu.RUnlock()
+		updateStatsTable(snapshot)
+	}
+
 	type logEvent struct {
 		text  string
 		reset bool
 	}
 	logEvents := make(chan logEvent, 4096)
 	resetLog := func() {
+		logSensorMu.Lock()
+		logSensors = make(map[int]deviceSensors)
+		logSensorMu.Unlock()
 		select {
 		case logEvents <- logEvent{reset: true}:
 		default:
 		}
-	}
-	appendLog := func(text string) {
-		text = sanitizeLogLine(text)
-		lines := strings.Split(text, "\n")
-		for _, line := range lines {
-			select {
-			case logEvents <- logEvent{text: line}:
-			default:
-				// Drop logs if the UI can't keep up.
+		}
+		appendLog := func(text string) {
+			text = sanitizeLogLine(text)
+			handleLine := func(line string) {
+				if strings.Contains(line, "cu") || strings.Contains(line, "cl") {
+					if m := gpuStatLine.FindStringSubmatch(line); len(m) == 5 {
+						idx, _ := strconv.Atoi(m[1])
+						temp, _ := strconv.Atoi(m[2])
+						fan, _ := strconv.Atoi(m[3])
+						power, _ := strconv.ParseFloat(m[4], 64)
+						logSensorMu.Lock()
+						logSensors[idx] = deviceSensors{Temp: temp, Fan: fan, Power: power}
+						logSensorMu.Unlock()
+					}
+				}
+				select {
+				case logEvents <- logEvent{text: line}:
+				default:
+					// Drop logs if the UI can't keep up.
+				}
+			}
+			if strings.IndexByte(text, '\n') == -1 {
+				handleLine(text)
+				return
+			}
+			for _, line := range strings.Split(text, "\n") {
+				handleLine(line)
 			}
 		}
-	}
-	go func() {
-		ticker := time.NewTicker(200 * time.Millisecond)
-		defer ticker.Stop()
+		go func() {
+			ticker := time.NewTicker(500 * time.Millisecond)
+			defer ticker.Stop()
 
-		dirty := false
+			dirty := false
 
-		for {
+			for {
 			select {
 			case ev := <-logEvents:
 				if ev.reset {
@@ -278,13 +598,13 @@ func main() {
 				logBuf.Append(ev.text)
 				dirty = true
 
-			case <-ticker.C:
-				if !dirty {
-					continue
-				}
-				dirty = false
-				fyne.Do(func() {
-					logList.Refresh()
+				case <-ticker.C:
+					if !dirty || !logsTabActive.Load() {
+						continue
+					}
+					dirty = false
+					fyne.Do(func() {
+						logList.Refresh()
 					if followTailCheck.Checked {
 						logList.ScrollToBottom()
 					}
@@ -311,7 +631,7 @@ func main() {
 			walletRow.Show()
 			rpcRow.Hide()
 			reportHashrateCheck.Enable()
-			modeHint.SetText("Stratum: no node required; reward goes to the wallet above.")
+			modeHint.SetText("Solo Pool (Stratum): solo mining; no node required; reward goes to the wallet above.")
 		case modeRPCLocal:
 			poolRow.Hide()
 			workerRow.Hide()
@@ -341,7 +661,9 @@ func main() {
 			return
 		}
 		refreshBtn.Disable()
-		devicesBox.Objects = []fyne.CanvasObject{widget.NewLabel("Detecting GPUs...")}
+		devicesActivity.Show()
+		devicesActivity.Start()
+		devicesBox.Objects = []fyne.CanvasObject{devicesLoadingRow}
 		devicesBox.Refresh()
 
 		go func() {
@@ -351,6 +673,8 @@ func main() {
 			if err != nil {
 				appendLog(fmt.Sprintf("[devices] %v\n", err))
 				fyne.Do(func() {
+					devicesActivity.Stop()
+					devicesActivity.Hide()
 					if backendSelection == backendAuto {
 						backendResolvedHint.SetText(fmt.Sprintf("Auto resolved to: %s", strings.ToUpper(backend)))
 					} else {
@@ -399,9 +723,19 @@ func main() {
 			devMu.Lock()
 			devices = list
 			deviceChecks = newChecks
+			deviceLabelByIndex = make(map[int]string, len(list))
+			for _, d := range list {
+				label := d.Name
+				if strings.TrimSpace(d.PCI) != "" {
+					label = fmt.Sprintf("%s (%s)", d.Name, d.PCI)
+				}
+				deviceLabelByIndex[d.Index] = label
+			}
 			devMu.Unlock()
 
 			fyne.Do(func() {
+				devicesActivity.Stop()
+				devicesActivity.Hide()
 				if backendSelection == backendAuto {
 					backendResolvedHint.SetText(fmt.Sprintf("Auto resolved to: %s", strings.ToUpper(backend)))
 				} else {
@@ -410,6 +744,7 @@ func main() {
 				devicesBox.Objects = newObjects
 				devicesBox.Refresh()
 				refreshBtn.Enable()
+				refreshStatsTable()
 			})
 		}()
 	}
@@ -417,12 +752,14 @@ func main() {
 	backendSelect.OnChanged = func(_ string) { refreshDevices() }
 
 	var (
-		procMu      sync.Mutex
-		minerCmd    *exec.Cmd
-		minerCtx    context.Context
-		minerCancel context.CancelFunc
-		apiPort     int
-		pollCancel  context.CancelFunc
+		procMu          sync.Mutex
+		minerCmd        *exec.Cmd
+		minerCtx        context.Context
+		minerCancel     context.CancelFunc
+		apiPort         int
+		pollCancel      context.CancelFunc
+		waitingForStats atomic.Bool
+		lastAccepted    atomic.Int64
 	)
 
 	var startBtn *widget.Button
@@ -430,9 +767,14 @@ func main() {
 
 	setRunningUI := func(running bool) {
 		if running {
-			statusValue.SetText("Running")
-			statusDot.FillColor = theme.Color(theme.ColorNamePrimary)
-			statusDot.Refresh()
+			if waitingForStats.Load() {
+				setStatusText("Starting")
+				setConnectionBadge("Conn: Connecting", connConnectingColor)
+			} else {
+				setStatusText("Running")
+				setConnectionBadge("Conn: Live", connLiveColor)
+			}
+			setStatusDot(theme.Color(theme.ColorNamePrimary))
 			if startBtn != nil {
 				startBtn.Disable()
 			}
@@ -440,9 +782,11 @@ func main() {
 				stopBtn.Enable()
 			}
 		} else {
-			statusValue.SetText("Stopped")
-			statusDot.FillColor = theme.Color(theme.ColorNameDisabled)
-			statusDot.Refresh()
+			waitingForStats.Store(false)
+			lastAccepted.Store(0)
+			setStatusText("Stopped")
+			setStatusDot(theme.Color(theme.ColorNameDisabled))
+			setConnectionBadge("Conn: Offline", connOfflineColor)
 			hashrateValue.Text = "—"
 			hashrateValue.Refresh()
 			sharesValue.SetText("—")
@@ -451,6 +795,10 @@ func main() {
 			backendInUseValue.SetText("—")
 			hashrateHistory.Reset()
 			avgHashrateValue.SetText("Avg —")
+			lastStatMu.Lock()
+			lastStat = nil
+			lastStatMu.Unlock()
+			updateStatsTable(Stat{})
 			if startBtn != nil {
 				startBtn.Enable()
 			}
@@ -542,6 +890,7 @@ func main() {
 		cfg.SelectedDevices = selected
 		cfg.ReportHashrate = reportHashrateCheck.Checked
 		cfg.DisplayInterval = displayIntv
+		cfg.HWMon = hwmonCheck.Checked
 		return saveConfig(cfg)
 	}
 
@@ -572,6 +921,7 @@ func main() {
 		cfg.WalletAddress = strings.TrimSpace(walletEntry.Text)
 		cfg.WorkerName = strings.TrimSpace(workerEntry.Text)
 		cfg.ReportHashrate = reportHashrateCheck.Checked
+		cfg.HWMon = hwmonCheck.Checked
 
 		if diText := strings.TrimSpace(displayIntervalEntry.Text); diText != "" {
 			if di, err := strconv.Atoi(diText); err == nil && di >= 1 && di <= 1800 {
@@ -634,6 +984,9 @@ func main() {
 			"--api-bind", fmt.Sprintf("127.0.0.1:-%d", apiPort),
 			"--display-interval", strconv.Itoa(cfg.DisplayInterval),
 		}
+		if cfg.HWMon {
+			args = append(args, "--HWMON", "2")
+		}
 		if backend == backendCUDA {
 			args[0] = "-U"
 		}
@@ -670,6 +1023,8 @@ func main() {
 			return
 		}
 		minerCmd = cmd
+		waitingForStats.Store(true)
+		lastAccepted.Store(0)
 		setRunningUI(true)
 		if backendSelection == backendAuto {
 			backendInUseValue.SetText(fmt.Sprintf("Auto → %s", strings.ToUpper(backend)))
@@ -682,9 +1037,24 @@ func main() {
 
 		ctx, cancel := context.WithCancel(context.Background())
 		pollCancel = cancel
-		go pollStats(ctx, "127.0.0.1", apiPort, func(s Stat) {
+		go pollStats(ctx, "127.0.0.1", apiPort, cfg.HWMon, func(s Stat) {
+			firstStat := waitingForStats.Swap(false)
+			prevAccepted := lastAccepted.Swap(s.Accepted)
+			hasNewAccept := s.Accepted > prevAccepted
+			statCopy := s
+			statCopy.PerGPU_KHs = append([]int64(nil), s.PerGPU_KHs...)
+			statCopy.PerGPU_Power = append([]float64(nil), s.PerGPU_Power...)
+			statCopy.Temps = append([]int(nil), s.Temps...)
+			statCopy.Fans = append([]int(nil), s.Fans...)
+			lastStatMu.Lock()
+			lastStat = &statCopy
+			lastStatMu.Unlock()
 			hs := fmt.Sprintf("%.2f MH/s", float64(s.TotalKHs)/1000.0)
 			fyne.Do(func() {
+				if firstStat {
+					setStatusText("Running")
+					setConnectionBadge("Conn: Live", connLiveColor)
+				}
 				hashrateValue.Text = hs
 				hashrateValue.Refresh()
 				hashrateHistory.Add(float64(s.TotalKHs) / 1000.0)
@@ -694,8 +1064,12 @@ func main() {
 					avgHashrateValue.SetText("Avg —")
 				}
 				sharesValue.SetText(fmt.Sprintf("Accepted %d | Rejected %d | Invalid %d", s.Accepted, s.Rejected, s.Invalid))
+				if hasNewAccept {
+					highlightShares()
+				}
 				poolValue.SetText(s.Pool)
 				uptimeValue.SetText(fmt.Sprintf("%d min", s.UptimeMin))
+				updateStatsTable(statCopy)
 			})
 		}, func(err error) {
 			// Only show transient failures in log; API might not be ready yet.
@@ -759,80 +1133,76 @@ func main() {
 		stopBtn.Disable()
 	}
 
-	var advancedOpen bool
-	advancedToggleBtn := widget.NewButtonWithIcon("Advanced options", theme.SettingsIcon(), nil)
-	advancedToggleBtn.Importance = widget.LowImportance
+	devicesScroll := container.NewVScroll(devicesBox)
+	devicesScroll.SetMinSize(fyne.NewSize(0, 240))
 
-	quickBody := container.NewVBox(
+	connectionBody := container.NewVBox(
 		modeRow,
 		modeHint,
 		walletRow,
 		workerRow,
 		poolRow,
 		rpcRow,
-		container.NewHBox(layout.NewSpacer(), advancedToggleBtn),
 	)
-	quickPanel := panel("Quick Start", quickBody)
+	connectionPanel := panel("Connection", connectionBody)
 
-	devicesScroll := container.NewVScroll(devicesBox)
-	devicesScroll.SetMinSize(fyne.NewSize(0, 240))
-
-	advancedGrid := container.NewGridWithColumns(2,
+	hardwareGrid := container.NewGridWithColumns(2,
 		fieldLabel("GPU backend"), backendSelect,
 		fieldLabel("Display interval (s)"), displayIntervalEntry,
+		fieldLabel("Hardware monitoring"), hwmonCheck,
 		widget.NewLabel(""), reportHashrateCheck,
 	)
-	advancedBody := container.NewVBox(
-		advancedGrid,
+	hardwareBody := container.NewVBox(
+		hardwareGrid,
 		backendHint,
 		backendResolvedHint,
 		widget.NewSeparator(),
 		container.NewHBox(fieldLabel("GPUs"), layout.NewSpacer(), refreshBtn),
 		devicesScroll,
 	)
-	advancedPanel := panel("Advanced", advancedBody)
-	advancedPanel.Hide()
+	hardwarePanel := panel("Hardware", hardwareBody)
 
-	advancedToggleBtn.OnTapped = func() {
-		advancedOpen = !advancedOpen
-		if advancedOpen {
-			advancedPanel.Show()
-			advancedToggleBtn.SetText("Hide advanced")
-		} else {
-			advancedPanel.Hide()
-			advancedToggleBtn.SetText("Advanced options")
-		}
-	}
+	setupSplit := container.NewHSplit(connectionPanel, hardwarePanel)
+	setupSplit.Offset = 0.52
+	setupTab := container.NewPadded(setupSplit)
 
 	hashrate10mTitle := widget.NewLabelWithStyle("Hashrate (10 min)", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 	hashrate10mTitle.Wrapping = fyne.TextWrapOff
 	hashrate10mHeader := container.NewHBox(widget.NewIcon(theme.HistoryIcon()), hashrate10mTitle, layout.NewSpacer(), avgHashrateValue)
 
-	statusBody := container.NewVBox(
+	overviewGrid := container.NewGridWithColumns(4,
+		metricTileWithIcon("Backend", theme.ComputerIcon(), backendInUseValue),
+		metricTileWithIcon("Uptime", theme.HistoryIcon(), uptimeValue),
+		sharesTile,
+		metricTileWithIcon("Pool", theme.StorageIcon(), poolValue),
+	)
+	overviewBody := container.NewVBox(
 		fieldLabel("Total hashrate"),
 		hashrateValue,
-		container.NewGridWithColumns(4,
-			metricTileWithIcon("Backend", theme.ComputerIcon(), backendInUseValue),
-			metricTileWithIcon("Uptime", theme.HistoryIcon(), uptimeValue),
-			metricTileWithIcon("Shares", theme.ConfirmIcon(), sharesValue),
-			metricTileWithIcon("Pool", theme.StorageIcon(), poolValue),
-		),
-		metricTileWithHeader(hashrate10mHeader, hashrateHistory.Object()),
+		overviewGrid,
 	)
-	statusPanel := panel("Dashboard", statusBody)
+	overviewPanel := panel("Overview", overviewBody)
+		hashratePanel := panelWithHeader(hashrate10mHeader, hashrateHistory.Object())
+		statsScroll := container.NewVScroll(statsTable)
+		statsScroll.SetMinSize(fyne.NewSize(0, 220))
+		statsBody := container.NewVBox(statsHeaderRow, widget.NewSeparator(), statsScroll)
+		statsPanel := panel("Per-GPU", statsBody)
+		dashboardStack := container.NewVBox(overviewPanel, hashratePanel, statsPanel)
+		dashboardTab := container.NewPadded(container.NewVScroll(dashboardStack))
 
 	clearLogsBtn := widget.NewButtonWithIcon("Clear", theme.ContentClearIcon(), resetLog)
 	logBar := container.NewHBox(followTailCheck, layout.NewSpacer(), clearLogsBtn)
 	logPanel := panel("Logs", container.NewBorder(logBar, nil, nil, nil, logList))
+	logTab := container.NewPadded(logPanel)
 
-	leftStack := container.NewVBox(quickPanel, advancedPanel)
-	left := container.NewVScroll(container.NewPadded(leftStack))
-	left.SetMinSize(fyne.NewSize(420, 0))
-
-	right := container.NewVSplit(statusPanel, logPanel)
-	right.Offset = 0.30
-	mainSplit := container.NewHSplit(left, right)
-	mainSplit.Offset = 0.40
+		setupItem := container.NewTabItemWithIcon("Setup", theme.SettingsIcon(), setupTab)
+		dashboardItem := container.NewTabItemWithIcon("Dashboard", theme.HomeIcon(), dashboardTab)
+		logsItem := container.NewTabItemWithIcon("Logs", theme.ListIcon(), logTab)
+		tabs := container.NewAppTabs(setupItem, dashboardItem, logsItem)
+		logsTabActive.Store(false)
+		tabs.OnChanged = func(item *container.TabItem) {
+			logsTabActive.Store(item == logsItem)
+		}
 
 	headerTitle := canvas.NewText(appName, theme.Color(theme.ColorNamePrimary))
 	headerTitle.TextStyle = fyne.TextStyle{Bold: true}
@@ -843,13 +1213,25 @@ func main() {
 	statusPillBg := canvas.NewRectangle(theme.Color(theme.ColorNameButton))
 	statusPillBg.StrokeColor = theme.Color(theme.ColorNameSeparator)
 	statusPillBg.StrokeWidth = 1
+	statusPillBg.CornerRadius = theme.Padding()
 	statusPill := container.NewMax(
 		statusPillBg,
 		container.NewPadded(container.NewCenter(container.NewHBox(statusDotHolder, statusValue))),
 	)
 
 	headerLeft := container.NewVBox(headerTitle, headerSubtitle)
-	headerRight := container.NewGridWithColumns(3, statusPill, startBtn, stopBtn)
+	headerTileWidth := float32(180)
+	headerTileHeight := headerLeft.MinSize().Height
+	headerTileSize := fyne.NewSize(headerTileWidth, headerTileHeight)
+	wrapHeaderTile := func(obj fyne.CanvasObject) fyne.CanvasObject {
+		return fixedSize(headerTileSize, obj)
+	}
+	headerRight := container.NewHBox(
+		wrapHeaderTile(connectionBadge),
+		wrapHeaderTile(statusPill),
+		wrapHeaderTile(startBtn),
+		wrapHeaderTile(stopBtn),
+	)
 	headerRow := container.NewHBox(headerLeft, layout.NewSpacer(), headerRight)
 
 	headerBg := canvas.NewRectangle(theme.Color(theme.ColorNameInputBackground))
@@ -862,7 +1244,7 @@ func main() {
 		color.NRGBA{R: 0x0F, G: 0x17, B: 0x2A, A: 0xFF},
 		145,
 	)
-	main := container.NewBorder(container.NewVBox(header, widget.NewSeparator()), nil, nil, nil, container.NewPadded(mainSplit))
+	main := container.NewBorder(container.NewVBox(header, widget.NewSeparator()), nil, nil, nil, tabs)
 	w.SetContent(container.NewMax(bg, main))
 
 	if ethminerErr != nil {
@@ -909,6 +1291,7 @@ func loadConfig() *Config {
 		SelectedDevices: nil,
 		ReportHashrate:  true,
 		DisplayInterval: 10,
+		HWMon:           false,
 	}
 	path, err := configPath()
 	if err != nil {
@@ -1078,6 +1461,7 @@ func findEthminer() (string, error) {
 }
 
 var deviceLine = regexp.MustCompile(`^\s*(\d+)\s+(\S+)\s+\S+\s+(.+?)\s+(Yes|No)\s+`)
+var gpuStatLine = regexp.MustCompile(`\b(?:cu|cl)(\d+)\s+(?:[0-9]+(?:\.[0-9]+)?\s+)?(\d+)C\s+(\d+)%\s+([0-9]+(?:\.[0-9]+)?)W\b`)
 
 func resolveBackend(ethminerPath string, backend string) string {
 	if backend != backendAuto {
@@ -1158,9 +1542,39 @@ type apiResp struct {
 	Error  any             `json:"error"`
 }
 
-func pollStats(ctx context.Context, host string, port int, onStat func(Stat), onErr func(error)) {
+type deviceSensors struct {
+	Temp  int
+	Fan   int
+	Power float64
+}
+
+type detailSnapshot struct {
+	Sensors map[int]deviceSensors
+	Labels  map[int]string
+	Hashes  map[int]int64
+}
+
+type statDetail struct {
+	Devices []struct {
+		Index    int `json:"_index"`
+		Hardware struct {
+			Name    string    `json:"name"`
+			PCI     string    `json:"pci"`
+			Sensors []float64 `json:"sensors"`
+		} `json:"hardware"`
+		Mining struct {
+			Hashrate string `json:"hashrate"`
+		} `json:"mining"`
+	} `json:"devices"`
+}
+
+func pollStats(ctx context.Context, host string, port int, detail bool, onStat func(Stat), onErr func(error)) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
+
+	detailEvery := 3
+	detailTick := detailEvery - 1
+	var cachedDetail detailSnapshot
 
 	for {
 		select {
@@ -1171,6 +1585,22 @@ func pollStats(ctx context.Context, host string, port int, onStat func(Stat), on
 			if err != nil {
 				onErr(err)
 				continue
+			}
+			needDetail := detail || len(st.PerGPU_KHs) == 0
+			if needDetail {
+				detailTick++
+				if detailTick >= detailEvery || (len(cachedDetail.Sensors) == 0 && len(cachedDetail.Hashes) == 0) {
+					detailTick = 0
+					snapshot, err := getStatDetail(host, port)
+					if err != nil {
+						onErr(err)
+					} else {
+						cachedDetail = snapshot
+					}
+				}
+				if len(cachedDetail.Sensors) > 0 || len(cachedDetail.Hashes) > 0 {
+					applyDetail(&st, cachedDetail)
+				}
 			}
 			onStat(st)
 		}
@@ -1247,12 +1677,179 @@ func getStat1(host string, port int) (Stat, error) {
 	return st, nil
 }
 
+func getStatDetail(host string, port int) (detailSnapshot, error) {
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", host, port), 1*time.Second)
+	if err != nil {
+		return detailSnapshot{}, err
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(1500 * time.Millisecond))
+
+	req := `{"id":1,"jsonrpc":"2.0","method":"miner_getstatdetail"}`
+	if _, err := io.WriteString(conn, req+"\n"); err != nil {
+		return detailSnapshot{}, err
+	}
+	line, err := bufio.NewReader(conn).ReadBytes('\n')
+	if err != nil {
+		return detailSnapshot{}, err
+	}
+
+	var resp apiResp
+	if err := json.Unmarshal(line, &resp); err != nil {
+		return detailSnapshot{}, err
+	}
+	if resp.Error != nil {
+		return detailSnapshot{}, fmt.Errorf("api error: %v", resp.Error)
+	}
+	var detail statDetail
+	if err := json.Unmarshal(resp.Result, &detail); err != nil {
+		return detailSnapshot{}, err
+	}
+
+	snapshot := detailSnapshot{
+		Sensors: make(map[int]deviceSensors),
+		Labels:  make(map[int]string),
+		Hashes:  make(map[int]int64),
+	}
+	for _, dev := range detail.Devices {
+		temp := 0
+		fan := 0
+		power := -1.0
+		if len(dev.Hardware.Sensors) >= 1 {
+			temp = int(dev.Hardware.Sensors[0])
+		}
+		if len(dev.Hardware.Sensors) >= 2 {
+			fan = int(dev.Hardware.Sensors[1])
+		}
+		if len(dev.Hardware.Sensors) >= 3 {
+			power = dev.Hardware.Sensors[2]
+		}
+		snapshot.Sensors[dev.Index] = deviceSensors{Temp: temp, Fan: fan, Power: power}
+		if kh, ok := parseHashrateHex(dev.Mining.Hashrate); ok {
+			snapshot.Hashes[dev.Index] = kh
+		}
+
+		name := strings.TrimSpace(dev.Hardware.Name)
+		if name != "" {
+			label := name
+			if pci := strings.TrimSpace(dev.Hardware.PCI); pci != "" {
+				label = fmt.Sprintf("%s (%s)", name, pci)
+			}
+			snapshot.Labels[dev.Index] = label
+		}
+	}
+	return snapshot, nil
+}
+
+func parseHashrateHex(s string) (int64, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, false
+	}
+	s = strings.TrimPrefix(s, "0x")
+	if s == "" {
+		return 0, false
+	}
+	v, err := strconv.ParseUint(s, 16, 64)
+	if err != nil {
+		return 0, false
+	}
+	return int64(v / 1000), true
+}
+
+func applyDetail(st *Stat, detail detailSnapshot) {
+	if len(detail.Sensors) == 0 && len(detail.Hashes) == 0 {
+		return
+	}
+	maxIndex := len(st.PerGPU_KHs)
+	if len(st.Temps) > maxIndex {
+		maxIndex = len(st.Temps)
+	}
+	if len(st.Fans) > maxIndex {
+		maxIndex = len(st.Fans)
+	}
+	if len(st.PerGPU_Power) > maxIndex {
+		maxIndex = len(st.PerGPU_Power)
+	}
+	for idx := range detail.Sensors {
+		if idx+1 > maxIndex {
+			maxIndex = idx + 1
+		}
+	}
+	for idx := range detail.Hashes {
+		if idx+1 > maxIndex {
+			maxIndex = idx + 1
+		}
+	}
+	if maxIndex == 0 {
+		return
+	}
+
+	hashes := make([]int64, maxIndex)
+	temps := make([]int, maxIndex)
+	fans := make([]int, maxIndex)
+	power := make([]float64, maxIndex)
+	for i := range power {
+		power[i] = -1
+	}
+	copy(hashes, st.PerGPU_KHs)
+	copy(temps, st.Temps)
+	copy(fans, st.Fans)
+	copy(power, st.PerGPU_Power)
+
+	for idx, v := range detail.Hashes {
+		if idx < 0 || idx >= maxIndex {
+			continue
+		}
+		if v > 0 {
+			hashes[idx] = v
+		}
+	}
+	for idx, s := range detail.Sensors {
+		if idx < 0 || idx >= maxIndex {
+			continue
+		}
+		if s.Temp > 0 {
+			temps[idx] = s.Temp
+		}
+		if s.Fan > 0 {
+			fans[idx] = s.Fan
+		}
+		if s.Power >= 0 {
+			power[idx] = s.Power
+		}
+	}
+
+	st.PerGPU_KHs = hashes
+	st.Temps = temps
+	st.Fans = fans
+	st.PerGPU_Power = power
+}
+
 var ansiCSI = regexp.MustCompile(`\x1b\[[0-9;]*[A-Za-z]`)
 
 func sanitizeLogLine(s string) string {
 	// Strip common terminal control sequences and keep things readable in a GUI.
-	s = strings.ReplaceAll(s, "\r", "")
-	s = ansiCSI.ReplaceAllString(s, "")
+	if strings.IndexByte(s, '\r') >= 0 {
+		s = strings.ReplaceAll(s, "\r", "")
+	}
+	if strings.IndexByte(s, 0x1b) >= 0 {
+		s = ansiCSI.ReplaceAllString(s, "")
+	}
+
+	// Fast path: keep common ethminer ASCII logs without extra allocations.
+	asciiSafe := true
+	for i := 0; i < len(s); i++ {
+		b := s[i]
+		if b == '\n' || b == '\t' || b == ' ' || (b >= 0x21 && b <= 0x7e) {
+			continue
+		}
+		asciiSafe = false
+		break
+	}
+	if asciiSafe {
+		return s
+	}
 
 	var b strings.Builder
 	b.Grow(len(s))

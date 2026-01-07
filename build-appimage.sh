@@ -8,9 +8,10 @@ APPDIR="${DIST_DIR}/OlivetumMiner.AppDir"
 ETHMINER_SRC="${ETHMINER_SRC:-}"
 if [[ -z "${ETHMINER_SRC}" ]]; then
   for candidate in \
-    "${ROOT_DIR}/ethminer" \
+    "${ROOT_DIR}/../Olivetum-GPU-Miner/build_gcc12/ethminer/ethminer" \
     "${ROOT_DIR}/../Olivetum-GPU-Miner/build/ethminer/ethminer" \
-    "${ROOT_DIR}/../Olivetum-GPU-Miner-main/build/ethminer/ethminer"; do
+    "${ROOT_DIR}/../Olivetum-GPU-Miner-main/build/ethminer/ethminer" \
+    "${ROOT_DIR}/ethminer"; do
     if [[ -x "${candidate}" ]]; then
       ETHMINER_SRC="${candidate}"
       break
@@ -22,9 +23,11 @@ mkdir -p "${DIST_DIR}"
 
 if [[ ! -x "${ETHMINER_SRC}" ]]; then
   echo "ERROR: ethminer binary not found at: ${ETHMINER_SRC}" >&2
-  echo "Build it first in Olivetum-GPU-Miner-main (or adjust ETHMINER_SRC)." >&2
+  echo "Build it first in Olivetum-GPU-Miner (or adjust ETHMINER_SRC)." >&2
   exit 1
 fi
+
+echo "Using ethminer: ${ETHMINER_SRC}"
 
 echo "[1/4] Building GUI..."
 cd "${ROOT_DIR}"
