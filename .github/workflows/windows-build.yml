@@ -16,8 +16,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: CustosLigni/Olivetum-PoW
-          path: olivetum-pow
+          path: Olivetum-PoW
           fetch-depth: 1
+          submodules: recursive
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -50,9 +51,9 @@ jobs:
           CGO_ENABLED: "1"
         run: |
           set -euxo pipefail
-          cd olivetum-pow/core-geth
+          cd Olivetum-PoW
           go mod download
-          go build -trimpath -buildvcs=false -ldflags="-s -w" -o ../../dist/geth.exe ./cmd/geth
+          go build -trimpath -buildvcs=false -ldflags="-s -w" -o ../dist/geth.exe ./cmd/geth
 
       - name: Package (zip)
         shell: pwsh
