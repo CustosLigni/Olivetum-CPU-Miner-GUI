@@ -12,6 +12,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Checkout Olivetum-PoW
+        uses: actions/checkout@v4
+        with:
+          repository: CustosLigni/Olivetum-PoW
+          path: olivetum-pow
+          fetch-depth: 1
+
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
@@ -35,10 +42,30 @@ jobs:
           set -euxo pipefail
           mkdir -p dist
           go mod download
-          go build -trimpath -ldflags="-H=windowsgui -s -w" -o dist/OlivetumMiner.exe .
+          go build -trimpath -buildvcs=false -ldflags="-H=windowsgui -s -w" -o dist/OlivetumMiner.exe .
+
+      - name: Build (geth.exe)
+        shell: msys2 {0}
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          set -euxo pipefail
+          cd olivetum-pow/core-geth
+          go mod download
+          go build -trimpath -buildvcs=false -ldflags="-s -w" -o ../../dist/geth.exe ./cmd/geth
+
+      - name: Package (zip)
+        shell: pwsh
+        run: |
+          $zipPath = "dist/OlivetumMiner-windows-x86_64.zip"
+          if (Test-Path $zipPath) { Remove-Item -Force $zipPath }
+          Compress-Archive -Force -Path @(
+            "dist/OlivetumMiner.exe",
+            "dist/geth.exe"
+          ) -DestinationPath $zipPath
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: OlivetumMiner-windows-x86_64
-          path: dist/OlivetumMiner.exe
+          path: dist/OlivetumMiner-windows-x86_64.zip

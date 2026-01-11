@@ -5,6 +5,7 @@ A modern GUI wrapper for `ethminer` with Olivetumhash support. Built with Fyne.
 ## Features
 
 - Quick Start with mining mode selection (Stratum / Solo RPC)
+- Optional embedded node (geth) with bundled genesis (AppImage)
 - GPU backend selector (Auto / CUDA / OpenCL)
 - Per-device selection and live stats
 - Dashboard with hashrate history and logs
@@ -25,6 +26,7 @@ go build -trimpath -ldflags="-s -w" -o dist/olivetum-miner-gui .
 ```
 
 `ethminer` must be in the same directory as the GUI binary or available in `PATH`.
+To use the embedded node feature outside AppImage, `geth` must also be available next to the GUI binary or in `PATH`.
 
 ## Build (Windows)
 
@@ -39,6 +41,7 @@ go build -trimpath -ldflags="-H=windowsgui -s -w" -o dist\\OlivetumMiner.exe .
 ```
 
 Place `ethminer.exe` next to `OlivetumMiner.exe` (or make sure it is in `PATH`).
+To use the embedded node feature, also place `geth.exe` next to `OlivetumMiner.exe` (or make sure it is in `PATH`).
 
 ## Windows quick start (prebuilt)
 
@@ -58,15 +61,18 @@ This project is a GUI wrapper, it does not build `ethminer` from source.
 
 ## Build (AppImage)
 
-The AppImage bundles the GUI and `ethminer`.
+The AppImage bundles the GUI, `ethminer`, `geth` and the Olivetum genesis.
 
 ```bash
 export ETHMINER_SRC=/path/to/ethminer
+export GETH_SRC=/path/to/geth
 ./build-appimage.sh
 ```
 
 The script downloads `appimagetool` if missing and produces:
 `dist/OlivetumMiner-x86_64.AppImage`
+
+If `ETHMINER_SRC`/`GETH_SRC` are not provided, the script attempts to auto-detect them from sibling repos (recommended for the monorepo layout).
 
 ## Run (AppImage)
 
@@ -86,3 +92,16 @@ User settings are stored locally in:
 ```
 
 This file is not part of the repository and is created on first run.
+
+## Embedded node (geth)
+
+In `Setup` you can enable `Run a node` and start/stop the node from the GUI.
+
+For local solo mining using the embedded node:
+
+1. Select `Mode` → `Solo (Local RPC)`
+2. Enable `Run a node`
+3. Set your `Wallet` (used as `--miner.etherbase`)
+4. Click `Start mining`
+
+If the node is already running in sync-only mode, the GUI will ask you to restart it with the mining service enabled.

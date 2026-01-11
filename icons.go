@@ -3,11 +3,21 @@ package main
 import "fyne.io/fyne/v2"
 
 var (
-	iconHash = fyne.NewStaticResource("icon-hash.svg", []byte(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">
-  <path d="M8 3L6 21" stroke="#7CB342" stroke-width="2" stroke-linecap="round"/>
-  <path d="M16 3L14 21" stroke="#7CB342" stroke-width="2" stroke-linecap="round"/>
-  <path d="M4 9H20" stroke="#7CB342" stroke-width="2" stroke-linecap="round"/>
-  <path d="M3 15H19" stroke="#7CB342" stroke-width="2" stroke-linecap="round"/>
+	iconHash = fyne.NewStaticResource("icon-pickaxe.svg", []byte(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">
+  <g transform="rotate(35 12 12)">
+    <path d="M4 8C6.8 4.2 10.2 3 12 3s5.2 1.2 8 5" stroke="#9CA3AF" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M12 4.5V8.5" stroke="#9CA3AF" stroke-width="2.2" stroke-linecap="round"/>
+    <path d="M12 8.5V21" stroke="#B45309" stroke-width="2.4" stroke-linecap="round"/>
+    <path d="M10.7 21H13.3" stroke="#8B5E34" stroke-width="2.4" stroke-linecap="round"/>
+  </g>
+</svg>`))
+	iconPickaxeWhite = fyne.NewStaticResource("icon-pickaxe-white.svg", []byte(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">
+  <g transform="rotate(35 12 12)">
+    <path d="M4 8C6.8 4.2 10.2 3 12 3s5.2 1.2 8 5" stroke="#E5E7EB" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M12 4.5V8.5" stroke="#E5E7EB" stroke-width="2.2" stroke-linecap="round"/>
+    <path d="M12 8.5V21" stroke="#E5E7EB" stroke-width="2.4" stroke-linecap="round"/>
+    <path d="M10.7 21H13.3" stroke="#E5E7EB" stroke-width="2.4" stroke-linecap="round"/>
+  </g>
 </svg>`))
 	iconThermometer = fyne.NewStaticResource("icon-thermometer.svg", []byte(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">
   <rect x="10" y="3" width="4" height="10" rx="2" fill="#F87171"/>
@@ -24,4 +34,3 @@ var (
   <path d="M13 2L5 13h5l-1 9 8-11h-5l1-9z" fill="#FACC15"/>
 </svg>`))
 )
-

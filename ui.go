@@ -123,6 +123,60 @@ func (l *fixedSizeLayout) MinSize(objects []fyne.CanvasObject) fyne.Size {
 	return l.size
 }
 
+type centeredTileRowLayout struct {
+	Columns int
+}
+
+func (l *centeredTileRowLayout) Layout(objects []fyne.CanvasObject, size fyne.Size) {
+	if len(objects) == 0 {
+		return
+	}
+
+	columns := l.Columns
+	if columns <= 0 {
+		columns = len(objects)
+	}
+
+	padding := theme.Padding()
+	tileWidth := float32(0)
+	if size.Width > 0 && columns > 0 {
+		tileWidth = (size.Width - padding*float32(columns-1)) / float32(columns)
+		if tileWidth < 0 {
+			tileWidth = 0
+		}
+	}
+
+	groupWidth := tileWidth*float32(len(objects)) + padding*float32(len(objects)-1)
+	x := (size.Width - groupWidth) / 2
+	if x < 0 {
+		x = 0
+	}
+
+	for i, obj := range objects {
+		obj.Move(fyne.NewPos(x+float32(i)*(tileWidth+padding), 0))
+		obj.Resize(fyne.NewSize(tileWidth, size.Height))
+	}
+}
+
+func (l *centeredTileRowLayout) MinSize(objects []fyne.CanvasObject) fyne.Size {
+	if len(objects) == 0 {
+		return fyne.NewSize(0, 0)
+	}
+	padding := theme.Padding()
+	var maxW, maxH float32
+	for _, obj := range objects {
+		min := obj.MinSize()
+		if min.Width > maxW {
+			maxW = min.Width
+		}
+		if min.Height > maxH {
+			maxH = min.Height
+		}
+	}
+	width := maxW*float32(len(objects)) + padding*float32(len(objects)-1)
+	return fyne.NewSize(width, maxH)
+}
+
 type statsCell struct {
 	*fyne.Container
 	icon *widget.Icon
@@ -136,4 +190,33 @@ func newStatsCell() *statsCell {
 	text.Wrapping = fyne.TextWrapOff
 	cell := container.NewBorder(nil, nil, icon, nil, text)
 	return &statsCell{Container: cell, icon: icon, text: text}
+}
+
+type logRowView struct {
+	*fyne.Container
+	dot     *canvas.Circle
+	time    *widget.Label
+	message *widget.Label
+}
+
+func newLogRowView() *logRowView {
+	dot := canvas.NewCircle(theme.Color(theme.ColorNameDisabled))
+	dotSize := theme.TextSize() * 0.85
+	dotHolder := container.NewVBox(
+		layout.NewSpacer(),
+		container.NewGridWrap(fyne.NewSize(dotSize, dotSize), dot),
+		layout.NewSpacer(),
+	)
+
+	timeLabel := widget.NewLabelWithStyle("        ", fyne.TextAlignLeading, fyne.TextStyle{Monospace: true})
+	timeLabel.Wrapping = fyne.TextWrapOff
+	timeLabel.Importance = widget.LowImportance
+
+	msg := widget.NewLabel("")
+	msg.Wrapping = fyne.TextWrapOff
+	msg.TextStyle = fyne.TextStyle{Monospace: true}
+
+	left := container.NewHBox(dotHolder, timeLabel)
+	row := container.NewBorder(nil, nil, left, nil, msg)
+	return &logRowView{Container: row, dot: dot, time: timeLabel, message: msg}
 }

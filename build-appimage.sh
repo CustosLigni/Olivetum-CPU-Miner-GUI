@@ -19,6 +19,20 @@ if [[ -z "${ETHMINER_SRC}" ]]; then
   done
 fi
 
+GETH_SRC="${GETH_SRC:-}"
+if [[ -z "${GETH_SRC}" ]]; then
+  for candidate in \
+    "${ROOT_DIR}/../core-geth/build/bin/geth" \
+    "${ROOT_DIR}/geth"; do
+    if [[ -x "${candidate}" ]]; then
+      GETH_SRC="${candidate}"
+      break
+    fi
+  done
+fi
+
+GENESIS_SRC="${GENESIS_SRC:-${ROOT_DIR}/assets/olivetum_pow_genesis.json}"
+
 mkdir -p "${DIST_DIR}"
 
 if [[ ! -x "${ETHMINER_SRC}" ]]; then
@@ -27,7 +41,19 @@ if [[ ! -x "${ETHMINER_SRC}" ]]; then
   exit 1
 fi
 
+if [[ ! -x "${GETH_SRC}" ]]; then
+  echo "ERROR: geth binary not found at: ${GETH_SRC}" >&2
+  echo "Build it first in core-geth (or adjust GETH_SRC)." >&2
+  exit 1
+fi
+
+if [[ ! -f "${GENESIS_SRC}" ]]; then
+  echo "ERROR: genesis file not found at: ${GENESIS_SRC}" >&2
+  exit 1
+fi
+
 echo "Using ethminer: ${ETHMINER_SRC}"
+echo "Using geth: ${GETH_SRC}"
 
 echo "[1/4] Building GUI..."
 cd "${ROOT_DIR}"
@@ -37,12 +63,15 @@ go build -trimpath -ldflags="-s -w" -o "${DIST_DIR}/olivetum-miner-gui" ./...
 echo "[2/4] Building AppDir..."
 rm -rf "${APPDIR}"
 mkdir -p "${APPDIR}/usr/bin" \
+  "${APPDIR}/usr/share/olivetum" \
   "${APPDIR}/usr/share/applications" \
   "${APPDIR}/usr/share/icons/hicolor/scalable/apps"
 
 cp -f "${DIST_DIR}/olivetum-miner-gui" "${APPDIR}/usr/bin/olivetum-miner-gui"
 cp -f "${ETHMINER_SRC}" "${APPDIR}/usr/bin/ethminer"
-chmod +x "${APPDIR}/usr/bin/olivetum-miner-gui" "${APPDIR}/usr/bin/ethminer"
+cp -f "${GETH_SRC}" "${APPDIR}/usr/bin/geth"
+cp -f "${GENESIS_SRC}" "${APPDIR}/usr/share/olivetum/olivetum_pow_genesis.json"
+chmod +x "${APPDIR}/usr/bin/olivetum-miner-gui" "${APPDIR}/usr/bin/ethminer" "${APPDIR}/usr/bin/geth"
 
 cat > "${APPDIR}/usr/share/applications/olivetum-miner-gui.desktop" <<'EOF'
 [Desktop Entry]

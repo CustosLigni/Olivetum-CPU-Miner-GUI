@@ -39,7 +39,13 @@ const (
 	configFileName     = "config.json"
 	defaultStratumHost = "pool.olivetumchain.org"
 	defaultStratumPort = 8008
-	defaultRPCURL      = "http://127.0.0.1:18545"
+	defaultRPCURL      = "http://127.0.0.1:8545"
+
+	defaultNodeDataDirHint = "~/.olivetum/node"
+	defaultNodeRPCPort     = 8545
+	defaultNodeP2PPort     = 31333
+	defaultNodeVerbosity   = 3
+	defaultNodeBootnodes   = "enode://9862175626bb4e6b983e3f50d8dcb9bd2b2fa1d9bd9ad38840f026ba4f4a87ea451e375945426cdb4fb6ac58a1624da4f8241f2b67e87f05c6f4922e97682279@pool.olivetumchain.org:31333"
 
 	modeStratum    = "stratum"
 	modeRPCLocal   = "rpc-local"
@@ -48,6 +54,9 @@ const (
 	backendAuto   = "auto"
 	backendCUDA   = "cuda"
 	backendOpenCL = "opencl"
+
+	nodeModeSync = "sync"
+	nodeModeMine = "mine"
 )
 
 type Config struct {
@@ -62,6 +71,20 @@ type Config struct {
 	ReportHashrate  bool   `json:"reportHashrate"`
 	DisplayInterval int    `json:"displayInterval"`
 	HWMon           bool   `json:"hwMon"`
+
+	NodeEnabled   bool   `json:"nodeEnabled"`
+	NodeMode      string `json:"nodeMode"`
+	NodeDataDir   string `json:"nodeDataDir"`
+	NodeRPCPort   int    `json:"nodeRpcPort"`
+	NodeP2PPort   int    `json:"nodeP2pPort"`
+	NodeBootnodes string `json:"nodeBootnodes"`
+	NodeVerbosity int    `json:"nodeVerbosity"`
+	NodeEtherbase string `json:"nodeEtherbase"`
+
+	WatchdogEnabled         bool `json:"watchdogEnabled"`
+	WatchdogNoJobTimeoutSec int  `json:"watchdogNoJobTimeoutSec"`
+	WatchdogRestartDelaySec int  `json:"watchdogRestartDelaySec"`
+	WatchdogRetryWindowMin  int  `json:"watchdogRetryWindowMin"`
 }
 
 type Device struct {
@@ -83,6 +106,7 @@ type Stat struct {
 	Temps        []int
 	Fans         []int
 	Pool         string
+	Difficulty   float64
 }
 
 func main() {
@@ -176,6 +200,81 @@ func main() {
 	rpcEntry.SetText(cfg.RPCURL)
 	rpcEntry.SetPlaceHolder(defaultRPCURL)
 
+	nodeEnabledCheck := widget.NewCheck("Run a node", nil)
+	nodeEnabledCheck.SetChecked(cfg.NodeEnabled)
+
+	nodeModeLabels := []string{
+		"Sync only",
+		"Sync + mining service (CPU 1 thread)",
+	}
+	nodeModeKeyForLabel := map[string]string{
+		nodeModeLabels[0]: nodeModeSync,
+		nodeModeLabels[1]: nodeModeMine,
+	}
+	nodeModeLabelForKey := map[string]string{
+		nodeModeSync: nodeModeLabels[0],
+		nodeModeMine: nodeModeLabels[1],
+	}
+	nodeModeSelect := widget.NewSelect(nodeModeLabels, nil)
+	if initial, ok := nodeModeLabelForKey[cfg.NodeMode]; ok && initial != "" {
+		nodeModeSelect.SetSelected(initial)
+	} else {
+		nodeModeSelect.SetSelected(nodeModeLabels[0])
+	}
+	selectedNodeMode := func() string {
+		if v, ok := nodeModeKeyForLabel[strings.TrimSpace(nodeModeSelect.Selected)]; ok {
+			return v
+		}
+		return nodeModeSync
+	}
+
+	nodeEtherbaseEntry := widget.NewEntry()
+	nodeEtherbaseEntry.SetText(cfg.NodeEtherbase)
+	nodeEtherbaseEntry.SetPlaceHolder("0x...")
+
+	nodeDataDirEntry := widget.NewEntry()
+	if strings.TrimSpace(cfg.NodeDataDir) != "" {
+		nodeDataDirEntry.SetText(cfg.NodeDataDir)
+	}
+	nodeDataDirEntry.SetPlaceHolder(defaultNodeDataDirHint)
+
+	nodeRPCPortEntry := widget.NewEntry()
+	if cfg.NodeRPCPort > 0 {
+		nodeRPCPortEntry.SetText(strconv.Itoa(cfg.NodeRPCPort))
+	}
+	nodeRPCPortEntry.SetPlaceHolder(strconv.Itoa(defaultNodeRPCPort))
+
+	nodeP2PPortEntry := widget.NewEntry()
+	if cfg.NodeP2PPort > 0 {
+		nodeP2PPortEntry.SetText(strconv.Itoa(cfg.NodeP2PPort))
+	}
+	nodeP2PPortEntry.SetPlaceHolder(strconv.Itoa(defaultNodeP2PPort))
+
+	nodeBootnodesEntry := widget.NewMultiLineEntry()
+	nodeBootnodesEntry.SetText(cfg.NodeBootnodes)
+	nodeBootnodesEntry.SetPlaceHolder(defaultNodeBootnodes)
+
+	nodeVerbosityEntry := widget.NewEntry()
+	if cfg.NodeVerbosity > 0 {
+		nodeVerbosityEntry.SetText(strconv.Itoa(cfg.NodeVerbosity))
+	}
+	nodeVerbosityEntry.SetPlaceHolder(strconv.Itoa(defaultNodeVerbosity))
+
+	watchdogEnabledCheck := widget.NewCheck("Enable watchdog (restart miner if jobs stop)", nil)
+	watchdogEnabledCheck.SetChecked(cfg.WatchdogEnabled)
+
+	watchdogNoJobEntry := widget.NewEntry()
+	watchdogNoJobEntry.SetText(strconv.Itoa(cfg.WatchdogNoJobTimeoutSec))
+	watchdogNoJobEntry.SetPlaceHolder("120")
+
+	watchdogRestartDelayEntry := widget.NewEntry()
+	watchdogRestartDelayEntry.SetText(strconv.Itoa(cfg.WatchdogRestartDelaySec))
+	watchdogRestartDelayEntry.SetPlaceHolder("10")
+
+	watchdogRetryWindowEntry := widget.NewEntry()
+	watchdogRetryWindowEntry.SetText(strconv.Itoa(cfg.WatchdogRetryWindowMin))
+	watchdogRetryWindowEntry.SetPlaceHolder("10")
+
 	reportHashrateCheck := widget.NewCheck("Report hashrate to pool (-R)", nil)
 	reportHashrateCheck.SetChecked(cfg.ReportHashrate)
 
@@ -215,6 +314,22 @@ func main() {
 		connectionBadgeBg.Refresh()
 	}
 
+	nodeBadgeLabel := widget.NewLabelWithStyle("Node: Off", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
+	nodeBadgeLabel.Wrapping = fyne.TextWrapOff
+	nodeBadgeBg := canvas.NewRectangle(theme.Color(theme.ColorNameDisabledButton))
+	nodeBadgeBg.StrokeColor = theme.Color(theme.ColorNameSeparator)
+	nodeBadgeBg.StrokeWidth = 1
+	nodeBadgeBg.CornerRadius = theme.Padding() * 2
+	nodeBadge := container.NewMax(
+		nodeBadgeBg,
+		container.NewPadded(container.NewCenter(nodeBadgeLabel)),
+	)
+	setNodeBadge := func(text string, fill color.Color) {
+		nodeBadgeLabel.SetText(text)
+		nodeBadgeBg.FillColor = fill
+		nodeBadgeBg.Refresh()
+	}
+
 	hashrateValue := canvas.NewText("—", theme.Color(theme.ColorNameForeground))
 	hashrateValue.Alignment = fyne.TextAlignLeading
 	hashrateValue.TextStyle = fyne.TextStyle{Bold: true}
@@ -234,6 +349,11 @@ func main() {
 	poolValue.Wrapping = fyne.TextWrapWord
 	uptimeValue := widget.NewLabel("—")
 	backendInUseValue := widget.NewLabel("—")
+
+	currentBlockValue := widget.NewLabelWithStyle("—", fyne.TextAlignLeading, fyne.TextStyle{Monospace: true})
+	currentDifficultyValue := widget.NewLabelWithStyle("—", fyne.TextAlignLeading, fyne.TextStyle{Monospace: true})
+	lastFoundBlockValue := widget.NewLabelWithStyle("—", fyne.TextAlignLeading, fyne.TextStyle{Monospace: true})
+
 	sharesTile, sharesTileBg := metricTileWithIconBg("Shares", theme.ConfirmIcon(), sharesValue)
 	hashrateHistory := newHashrateChart(300) // ~10 minutes at 2s polling
 	avgHashrateValue := widget.NewLabelWithStyle("Avg —", fyne.TextAlignTrailing, fyne.TextStyle{Monospace: true})
@@ -300,60 +420,245 @@ func main() {
 	)
 	deviceLabelByIndex := make(map[int]string)
 
-	logBuf := newRingLogs(5000)
-	followTailCheck := widget.NewCheck("Follow tail", nil)
-	followTailCheck.SetChecked(true)
+	minerLogBuf := newRingLogs(5000)
+	nodeLogBuf := newRingLogs(5000)
+
+	minerFollowTailCheck := widget.NewCheck("Follow tail", nil)
+	minerFollowTailCheck.SetChecked(true)
+	nodeFollowTailCheck := widget.NewCheck("Follow tail", nil)
+	nodeFollowTailCheck.SetChecked(true)
+
 	var (
 		logSensorMu sync.RWMutex
 		logSensors  = make(map[int]deviceSensors)
 	)
-	var logsTabActive atomic.Bool
+	var (
+		logsTabActive   atomic.Bool
+		minerLogsActive atomic.Bool
+		nodeLogsActive  atomic.Bool
+	)
 
-	logList := widget.NewList(
-		func() int { return logBuf.Len() },
+	var (
+		minerLogSnapshotMu sync.RWMutex
+		minerLogSnapshot   []string
+		nodeLogSnapshotMu  sync.RWMutex
+		nodeLogSnapshot    []string
+	)
+	minerLogLen := func() int {
+		if !minerFollowTailCheck.Checked {
+			minerLogSnapshotMu.RLock()
+			defer minerLogSnapshotMu.RUnlock()
+			if minerLogSnapshot != nil {
+				return len(minerLogSnapshot)
+			}
+		}
+		return minerLogBuf.Len()
+	}
+	minerLogAt := func(idx int) string {
+		if !minerFollowTailCheck.Checked {
+			minerLogSnapshotMu.RLock()
+			defer minerLogSnapshotMu.RUnlock()
+			if idx >= 0 && idx < len(minerLogSnapshot) {
+				return minerLogSnapshot[idx]
+			}
+		}
+		return minerLogBuf.At(idx)
+	}
+	nodeLogLen := func() int {
+		if !nodeFollowTailCheck.Checked {
+			nodeLogSnapshotMu.RLock()
+			defer nodeLogSnapshotMu.RUnlock()
+			if nodeLogSnapshot != nil {
+				return len(nodeLogSnapshot)
+			}
+		}
+		return nodeLogBuf.Len()
+	}
+	nodeLogAt := func(idx int) string {
+		if !nodeFollowTailCheck.Checked {
+			nodeLogSnapshotMu.RLock()
+			defer nodeLogSnapshotMu.RUnlock()
+			if idx >= 0 && idx < len(nodeLogSnapshot) {
+				return nodeLogSnapshot[idx]
+			}
+		}
+		return nodeLogBuf.At(idx)
+	}
+
+	logLineRe := regexp.MustCompile(`^([a-zA-Z])\s+(\d{2}:\d{2}:\d{2})\s+(.*)$`)
+	logInfoColor := color.NRGBA{R: 0x60, G: 0xA5, B: 0xFA, A: 0xFF}
+	logMinerColor := color.NRGBA{R: 0x7C, G: 0xB3, B: 0x42, A: 0xFF}
+	logWarnColor := color.NRGBA{R: 0xFA, G: 0xCC, B: 0x15, A: 0xFF}
+	logErrorColor := color.NRGBA{R: 0xF8, G: 0x71, B: 0x71, A: 0xFF}
+
+	type logRowRefs struct {
+		dot     *canvas.Circle
+		time    *widget.Label
+		message *widget.Label
+	}
+	var logRowRefsByContainer sync.Map
+
+	parseLogLine := func(line string) (level, ts, msg string) {
+		line = strings.TrimRight(line, "\r\n")
+		if strings.TrimSpace(line) == "" {
+			return "", "", ""
+		}
+		if m := logLineRe.FindStringSubmatch(line); m != nil {
+			return strings.ToLower(m[1]), m[2], m[3]
+		}
+		return "", "", line
+	}
+
+	logColorForLine := func(level, raw string) color.Color {
+		lower := strings.ToLower(raw)
+		switch {
+		case strings.Contains(lower, "error") || strings.Contains(lower, "fatal") || strings.Contains(lower, "failed"):
+			return logErrorColor
+		case strings.Contains(lower, "warn"):
+			return logWarnColor
+		}
+		switch level {
+		case "e":
+			return logErrorColor
+		case "w":
+			return logWarnColor
+		case "m":
+			return logMinerColor
+		case "i":
+			return logInfoColor
+		default:
+			return theme.Color(theme.ColorNameDisabled)
+		}
+	}
+
+	newLogRow := func() fyne.CanvasObject {
+		dot := canvas.NewCircle(theme.Color(theme.ColorNameDisabled))
+		dotSize := theme.TextSize() * 0.85
+		dotHolder := container.NewVBox(
+			layout.NewSpacer(),
+			container.NewGridWrap(fyne.NewSize(dotSize, dotSize), dot),
+			layout.NewSpacer(),
+		)
+
+		timeLabel := widget.NewLabelWithStyle("", fyne.TextAlignLeading, fyne.TextStyle{Monospace: true})
+		timeLabel.Wrapping = fyne.TextWrapOff
+		timeLabel.Importance = widget.LowImportance
+
+		msg := widget.NewLabel("")
+		msg.Wrapping = fyne.TextWrapOff
+		msg.TextStyle = fyne.TextStyle{Monospace: true}
+
+		row := container.NewBorder(nil, nil, container.NewHBox(dotHolder, timeLabel), nil, msg)
+		logRowRefsByContainer.Store(row, &logRowRefs{dot: dot, time: timeLabel, message: msg})
+		return row
+	}
+
+	applyLogRow := func(item fyne.CanvasObject, line string) {
+		row, ok := item.(*fyne.Container)
+		if !ok {
+			return
+		}
+		v, ok := logRowRefsByContainer.Load(row)
+		if !ok {
+			return
+		}
+		refs, ok := v.(*logRowRefs)
+		if !ok || refs == nil {
+			return
+		}
+
+		level, ts, msg := parseLogLine(line)
+		refs.dot.FillColor = logColorForLine(level, line)
+		refs.dot.Refresh()
+		if ts != "" {
+			refs.time.SetText(ts + " ")
+		} else {
+			refs.time.SetText("")
+		}
+		refs.message.SetText(msg)
+	}
+
+	minerLogList := widget.NewList(
+		func() int { return minerLogLen() },
 		func() fyne.CanvasObject {
-			l := widget.NewLabel("")
-			l.TextStyle = fyne.TextStyle{Monospace: true}
-			return l
+			return newLogRow()
 		},
 		func(id widget.ListItemID, item fyne.CanvasObject) {
-			item.(*widget.Label).SetText(logBuf.At(int(id)))
+			applyLogRow(item, minerLogAt(int(id)))
+		},
+	)
+	nodeLogList := widget.NewList(
+		func() int { return nodeLogLen() },
+		func() fyne.CanvasObject {
+			return newLogRow()
+		},
+		func(id widget.ListItemID, item fyne.CanvasObject) {
+			applyLogRow(item, nodeLogAt(int(id)))
 		},
 	)
 
-		type statsHeaderCell struct {
-			Label string
-			Icon  fyne.Resource
+	minerFollowTailCheck.OnChanged = func(enabled bool) {
+		if enabled {
+			minerLogSnapshotMu.Lock()
+			minerLogSnapshot = nil
+			minerLogSnapshotMu.Unlock()
+			minerLogList.Refresh()
+			minerLogList.ScrollToBottom()
+			return
 		}
-		statsHeader := []statsHeaderCell{
-			{Label: "GPU"},
-			{Label: "Name"},
-			{Label: "Hashrate", Icon: iconHash},
-			{Label: "Temp", Icon: iconThermometer},
-			{Label: "Fan", Icon: iconFan},
-			{Label: "Power", Icon: iconBolt},
+		minerLogSnapshotMu.Lock()
+		minerLogSnapshot = minerLogBuf.Snapshot()
+		minerLogSnapshotMu.Unlock()
+		minerLogList.Refresh()
+	}
+	nodeFollowTailCheck.OnChanged = func(enabled bool) {
+		if enabled {
+			nodeLogSnapshotMu.Lock()
+			nodeLogSnapshot = nil
+			nodeLogSnapshotMu.Unlock()
+			nodeLogList.Refresh()
+			nodeLogList.ScrollToBottom()
+			return
 		}
-		statsColWidths := []float32{60, 260, 130, 90, 90, 100}
-		statsHeaderHeight := theme.TextSize() * 1.8
-		statsHeaderRow := func() fyne.CanvasObject {
-			iconSize := theme.TextSize() * 1.1
-			cells := make([]fyne.CanvasObject, 0, len(statsHeader))
-			for i, cell := range statsHeader {
-				label := widget.NewLabelWithStyle(cell.Label, fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
-				label.Wrapping = fyne.TextWrapOff
-				var content fyne.CanvasObject = label
-				if cell.Icon != nil {
-					icon := widget.NewIcon(cell.Icon)
-					content = container.NewHBox(container.NewGridWrap(fyne.NewSize(iconSize, iconSize), icon), label)
-				}
-				width := float32(120)
-				if i >= 0 && i < len(statsColWidths) {
-					width = statsColWidths[i]
-				}
-				cells = append(cells, fixedSize(fyne.NewSize(width, statsHeaderHeight), content))
+		nodeLogSnapshotMu.Lock()
+		nodeLogSnapshot = nodeLogBuf.Snapshot()
+		nodeLogSnapshotMu.Unlock()
+		nodeLogList.Refresh()
+	}
+
+	type statsHeaderCell struct {
+		Label string
+		Icon  fyne.Resource
+	}
+	statsHeader := []statsHeaderCell{
+		{Label: "GPU"},
+		{Label: "Name"},
+		{Label: "Hashrate", Icon: iconHash},
+		{Label: "Temp", Icon: iconThermometer},
+		{Label: "Fan", Icon: iconFan},
+		{Label: "Power", Icon: iconBolt},
+	}
+	statsColWidths := []float32{60, 260, 130, 90, 90, 100}
+	statsHeaderHeight := theme.TextSize() * 1.8
+	statsHeaderRow := func() fyne.CanvasObject {
+		iconSize := theme.TextSize() * 1.1
+		cells := make([]fyne.CanvasObject, 0, len(statsHeader))
+		for i, cell := range statsHeader {
+			label := widget.NewLabelWithStyle(cell.Label, fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+			label.Wrapping = fyne.TextWrapOff
+			var content fyne.CanvasObject = label
+			if cell.Icon != nil {
+				icon := widget.NewIcon(cell.Icon)
+				content = container.NewHBox(container.NewGridWrap(fyne.NewSize(iconSize, iconSize), icon), label)
 			}
-			return container.NewHBox(cells...)
-		}()
+			width := float32(120)
+			if i >= 0 && i < len(statsColWidths) {
+				width = statsColWidths[i]
+			}
+			cells = append(cells, fixedSize(fyne.NewSize(width, statsHeaderHeight), content))
+		}
+		return container.NewHBox(cells...)
+	}()
 	type statsRow struct {
 		Index    int
 		Name     string
@@ -369,26 +674,26 @@ func main() {
 		lastStatMu sync.RWMutex
 	)
 
-		statsTable := widget.NewTable(
-			func() (int, int) {
-				statsMu.RLock()
-				defer statsMu.RUnlock()
-				return len(statsRows), len(statsHeader)
-			},
-			func() fyne.CanvasObject {
-				l := widget.NewLabel("")
-				l.Wrapping = fyne.TextWrapOff
-				return l
-			},
-			func(id widget.TableCellID, obj fyne.CanvasObject) {
-				text := obj.(*widget.Label)
-				text.Alignment = fyne.TextAlignLeading
-				text.TextStyle = fyne.TextStyle{}
-				row := id.Row
-				statsMu.RLock()
-				var data statsRow
-				if row >= 0 && row < len(statsRows) {
-					data = statsRows[row]
+	statsTable := widget.NewTable(
+		func() (int, int) {
+			statsMu.RLock()
+			defer statsMu.RUnlock()
+			return len(statsRows), len(statsHeader)
+		},
+		func() fyne.CanvasObject {
+			l := widget.NewLabel("")
+			l.Wrapping = fyne.TextWrapOff
+			return l
+		},
+		func(id widget.TableCellID, obj fyne.CanvasObject) {
+			text := obj.(*widget.Label)
+			text.Alignment = fyne.TextAlignLeading
+			text.TextStyle = fyne.TextStyle{}
+			row := id.Row
+			statsMu.RLock()
+			var data statsRow
+			if row >= 0 && row < len(statsRows) {
+				data = statsRows[row]
 			}
 			statsMu.RUnlock()
 
@@ -431,13 +736,13 @@ func main() {
 				}
 			default:
 				text.SetText("")
-				}
-				text.Refresh()
-			},
-		)
-		for i, w := range statsColWidths {
-			statsTable.SetColumnWidth(i, w)
-		}
+			}
+			text.Refresh()
+		},
+	)
+	for i, w := range statsColWidths {
+		statsTable.SetColumnWidth(i, w)
+	}
 
 	updateStatsTable := func(s Stat) {
 		devMu.Lock()
@@ -521,13 +826,13 @@ func main() {
 			})
 		}
 
-			sort.Slice(rows, func(i, j int) bool { return rows[i].Index < rows[j].Index })
+		sort.Slice(rows, func(i, j int) bool { return rows[i].Index < rows[j].Index })
 
-			statsMu.Lock()
-			statsRows = rows
-			statsMu.Unlock()
-			statsTable.Refresh()
-		}
+		statsMu.Lock()
+		statsRows = rows
+		statsMu.Unlock()
+		statsTable.Refresh()
+	}
 
 	refreshStatsTable := func() {
 		lastStatMu.RLock()
@@ -543,71 +848,166 @@ func main() {
 		text  string
 		reset bool
 	}
-	logEvents := make(chan logEvent, 4096)
-	resetLog := func() {
+
+	var (
+		minerStartedAt  atomic.Int64
+		lastJobAt       atomic.Int64
+		currentJobBlock atomic.Int64
+		lastFoundBlock  atomic.Int64
+		jobDifficulty   atomic.Value
+	)
+	jobDifficulty.Store("")
+
+	minerLogEvents := make(chan logEvent, 4096)
+	nodeLogEvents := make(chan logEvent, 4096)
+
+	resetMinerLog := func() {
 		logSensorMu.Lock()
 		logSensors = make(map[int]deviceSensors)
 		logSensorMu.Unlock()
 		select {
-		case logEvents <- logEvent{reset: true}:
+		case minerLogEvents <- logEvent{reset: true}:
 		default:
 		}
+	}
+	resetNodeLog := func() {
+		select {
+		case nodeLogEvents <- logEvent{reset: true}:
+		default:
 		}
-		appendLog := func(text string) {
-			text = sanitizeLogLine(text)
-			handleLine := func(line string) {
-				if strings.Contains(line, "cu") || strings.Contains(line, "cl") {
-					if m := gpuStatLine.FindStringSubmatch(line); len(m) == 5 {
-						idx, _ := strconv.Atoi(m[1])
-						temp, _ := strconv.Atoi(m[2])
-						fan, _ := strconv.Atoi(m[3])
-						power, _ := strconv.ParseFloat(m[4], 64)
-						logSensorMu.Lock()
-						logSensors[idx] = deviceSensors{Temp: temp, Fan: fan, Power: power}
-						logSensorMu.Unlock()
-					}
-				}
-				select {
-				case logEvents <- logEvent{text: line}:
-				default:
-					// Drop logs if the UI can't keep up.
+	}
+
+	appendMinerLog := func(text string) {
+		text = sanitizeLogLine(text)
+		handleLine := func(line string) {
+			if strings.Contains(line, "cu") || strings.Contains(line, "cl") {
+				if m := gpuStatLine.FindStringSubmatch(line); len(m) == 5 {
+					idx, _ := strconv.Atoi(m[1])
+					temp, _ := strconv.Atoi(m[2])
+					fan, _ := strconv.Atoi(m[3])
+					power, _ := strconv.ParseFloat(m[4], 64)
+					logSensorMu.Lock()
+					logSensors[idx] = deviceSensors{Temp: temp, Fan: fan, Power: power}
+					logSensorMu.Unlock()
 				}
 			}
-			if strings.IndexByte(text, '\n') == -1 {
-				handleLine(text)
-				return
+			if m := jobBlockLine.FindStringSubmatch(line); len(m) == 2 {
+				if block, err := strconv.ParseInt(m[1], 10, 64); err == nil && block > 0 {
+					currentJobBlock.Store(block)
+				}
+				lastJobAt.Store(time.Now().UnixNano())
 			}
-			for _, line := range strings.Split(text, "\n") {
-				handleLine(line)
-			}
-		}
-		go func() {
-			ticker := time.NewTicker(500 * time.Millisecond)
-			defer ticker.Stop()
-
-			dirty := false
-
-			for {
 			select {
-			case ev := <-logEvents:
+			case minerLogEvents <- logEvent{text: line}:
+			default:
+				// Drop logs if the UI can't keep up.
+			}
+		}
+		if strings.IndexByte(text, '\n') == -1 {
+			handleLine(text)
+			return
+		}
+		for _, line := range strings.Split(text, "\n") {
+			handleLine(line)
+		}
+	}
+
+	appendNodeLog := func(text string) {
+		text = sanitizeLogLine(text)
+		handleLine := func(line string) {
+			if m := nodeMinedPotentialBlockLine.FindStringSubmatch(line); len(m) == 2 {
+				n := strings.ReplaceAll(m[1], ",", "")
+				if block, err := strconv.ParseInt(n, 10, 64); err == nil && block > 0 {
+					lastFoundBlock.Store(block)
+					fyne.Do(func() { lastFoundBlockValue.SetText(fmt.Sprintf("%d", block)) })
+				}
+			} else if m := nodeSealedNewBlockLine.FindStringSubmatch(line); len(m) == 2 {
+				n := strings.ReplaceAll(m[1], ",", "")
+				if block, err := strconv.ParseInt(n, 10, 64); err == nil && block > 0 {
+					lastFoundBlock.Store(block)
+					fyne.Do(func() { lastFoundBlockValue.SetText(fmt.Sprintf("%d", block)) })
+				}
+			}
+			select {
+			case nodeLogEvents <- logEvent{text: line}:
+			default:
+				// Drop logs if the UI can't keep up.
+			}
+		}
+		if strings.IndexByte(text, '\n') == -1 {
+			handleLine(text)
+			return
+		}
+		for _, line := range strings.Split(text, "\n") {
+			handleLine(line)
+		}
+	}
+
+	go func() {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+
+		dirty := false
+		for {
+			select {
+			case ev := <-minerLogEvents:
 				if ev.reset {
-					logBuf.Clear()
+					minerLogBuf.Clear()
 					dirty = true
 					continue
 				}
-				logBuf.Append(ev.text)
+				minerLogBuf.Append(ev.text)
 				dirty = true
 
-				case <-ticker.C:
-					if !dirty || !logsTabActive.Load() {
-						continue
-					}
-					dirty = false
-					fyne.Do(func() {
-						logList.Refresh()
-					if followTailCheck.Checked {
-						logList.ScrollToBottom()
-					}
+			case <-ticker.C:
+				if !dirty || !logsTabActive.Load() || !minerLogsActive.Load() {
+					continue
+				}
+				minerLogSnapshotMu.RLock()
+				paused := minerLogSnapshot != nil
+				minerLogSnapshotMu.RUnlock()
+				dirty = false
+				if paused {
+					continue
+				}
+				fyne.Do(func() {
+					minerLogList.Refresh()
+					minerLogList.ScrollToBottom()
+				})
+			}
+		}
+	}()
+
+	go func() {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+
+		dirty := false
+		for {
+			select {
+			case ev := <-nodeLogEvents:
+				if ev.reset {
+					nodeLogBuf.Clear()
+					dirty = true
+					continue
+				}
+				nodeLogBuf.Append(ev.text)
+				dirty = true
+
+			case <-ticker.C:
+				if !dirty || !logsTabActive.Load() || !nodeLogsActive.Load() {
+					continue
+				}
+				nodeLogSnapshotMu.RLock()
+				paused := nodeLogSnapshot != nil
+				nodeLogSnapshotMu.RUnlock()
+				dirty = false
+				if paused {
+					continue
+				}
+				fyne.Do(func() {
+					nodeLogList.Refresh()
+					nodeLogList.ScrollToBottom()
 				})
 			}
 		}
@@ -630,6 +1030,7 @@ func main() {
 			workerRow.Show()
 			walletRow.Show()
 			rpcRow.Hide()
+			rpcEntry.Enable()
 			reportHashrateCheck.Enable()
 			modeHint.SetText("Solo Pool (Stratum): solo mining; no node required; reward goes to the wallet above.")
 		case modeRPCLocal:
@@ -637,13 +1038,15 @@ func main() {
 			workerRow.Hide()
 			walletRow.Hide()
 			rpcRow.Show()
+			rpcEntry.Enable()
 			reportHashrateCheck.Disable()
-			modeHint.SetText("RPC local: mines to node coinbase; wallet/worker ignored.")
+			modeHint.SetText("RPC local: mines to node coinbase; wallet/worker ignored. If you enable Run a node, set the mining address in Node settings.")
 		case modeRPCGateway:
 			poolRow.Hide()
 			workerRow.Hide()
 			walletRow.Show()
 			rpcRow.Show()
+			rpcEntry.Enable()
 			reportHashrateCheck.Disable()
 			modeHint.SetText("RPC gateway: node must support olivetumhash_getWorkFor; reward goes to wallet above.")
 		default:
@@ -671,7 +1074,7 @@ func main() {
 			backend := resolveBackend(ethminerPath, backendSelection)
 			list, out, err := listEthminerDevices(ethminerPath, backend)
 			if err != nil {
-				appendLog(fmt.Sprintf("[devices] %v\n", err))
+				appendMinerLog(fmt.Sprintf("[devices] %v\n", err))
 				fyne.Do(func() {
 					devicesActivity.Stop()
 					devicesActivity.Hide()
@@ -703,7 +1106,7 @@ func main() {
 					backendName = "CUDA"
 				}
 				if strings.TrimSpace(out) != "" {
-					appendLog(fmt.Sprintf("[devices] %s --list-devices output:\n%s\n", backendName, strings.TrimSpace(out)))
+					appendMinerLog(fmt.Sprintf("[devices] %s --list-devices output:\n%s\n", backendName, strings.TrimSpace(out)))
 				}
 				newObjects = []fyne.CanvasObject{
 					widget.NewLabel(fmt.Sprintf("No %s devices found. If you use NVIDIA, pick CUDA. For AMD/Intel, install drivers with OpenCL support.", backendName)),
@@ -752,18 +1155,27 @@ func main() {
 	backendSelect.OnChanged = func(_ string) { refreshDevices() }
 
 	var (
-		procMu          sync.Mutex
-		minerCmd        *exec.Cmd
-		minerCtx        context.Context
-		minerCancel     context.CancelFunc
-		apiPort         int
-		pollCancel      context.CancelFunc
-		waitingForStats atomic.Bool
-		lastAccepted    atomic.Int64
+		procMu             sync.Mutex
+		minerCmd           *exec.Cmd
+		minerCtx           context.Context
+		minerCancel        context.CancelFunc
+		apiPort            int
+		pollCancel         context.CancelFunc
+		waitingForStats    atomic.Bool
+		lastAccepted       atomic.Int64
+		watchdogCancel     context.CancelFunc
+		watchdogRestarting atomic.Bool
+
+		nodeCmd     *exec.Cmd
+		nodeCtx     context.Context
+		nodeCancel  context.CancelFunc
+		nodeRunMode string
 	)
 
 	var startBtn *widget.Button
 	var stopBtn *widget.Button
+	var nodeStartBtn *widget.Button
+	var nodeStopBtn *widget.Button
 
 	setRunningUI := func(running bool) {
 		if running {
@@ -784,6 +1196,10 @@ func main() {
 		} else {
 			waitingForStats.Store(false)
 			lastAccepted.Store(0)
+			lastJobAt.Store(0)
+			currentJobBlock.Store(0)
+			lastFoundBlock.Store(0)
+			jobDifficulty.Store("")
 			setStatusText("Stopped")
 			setStatusDot(theme.Color(theme.ColorNameDisabled))
 			setConnectionBadge("Conn: Offline", connOfflineColor)
@@ -793,6 +1209,9 @@ func main() {
 			poolValue.SetText("—")
 			uptimeValue.SetText("—")
 			backendInUseValue.SetText("—")
+			currentBlockValue.SetText("—")
+			currentDifficultyValue.SetText("—")
+			lastFoundBlockValue.SetText("—")
 			hashrateHistory.Reset()
 			avgHashrateValue.SetText("Avg —")
 			lastStatMu.Lock()
@@ -852,8 +1271,6 @@ func main() {
 			if !isHexAddress(wallet) {
 				return errors.New("invalid wallet address (expected 0x + 40 hex chars)")
 			}
-		} else if wallet != "" && !isHexAddress(wallet) {
-			return errors.New("invalid wallet address (expected 0x + 40 hex chars)")
 		}
 
 		worker := strings.TrimSpace(workerEntry.Text)
@@ -885,12 +1302,88 @@ func main() {
 		cfg.StratumHost = host
 		cfg.StratumPort = port
 		cfg.RPCURL = rpcURL
-		cfg.WalletAddress = strings.ToLower(wallet)
+		if isHexAddress(wallet) {
+			cfg.WalletAddress = strings.ToLower(wallet)
+		} else {
+			cfg.WalletAddress = wallet
+		}
 		cfg.WorkerName = worker
 		cfg.SelectedDevices = selected
 		cfg.ReportHashrate = reportHashrateCheck.Checked
 		cfg.DisplayInterval = displayIntv
 		cfg.HWMon = hwmonCheck.Checked
+
+		cfg.NodeEnabled = nodeEnabledCheck.Checked
+		cfg.NodeMode = selectedNodeMode()
+
+		cfg.NodeDataDir = strings.TrimSpace(nodeDataDirEntry.Text)
+
+		nodeRPCPort := defaultNodeRPCPort
+		if strings.TrimSpace(nodeRPCPortEntry.Text) != "" {
+			nodeRPCPort, err = strconv.Atoi(strings.TrimSpace(nodeRPCPortEntry.Text))
+			if err != nil || nodeRPCPort < 1 || nodeRPCPort > 65535 {
+				return errors.New("invalid node RPC port")
+			}
+		}
+		cfg.NodeRPCPort = nodeRPCPort
+
+		nodeP2PPort := defaultNodeP2PPort
+		if strings.TrimSpace(nodeP2PPortEntry.Text) != "" {
+			nodeP2PPort, err = strconv.Atoi(strings.TrimSpace(nodeP2PPortEntry.Text))
+			if err != nil || nodeP2PPort < 1 || nodeP2PPort > 65535 {
+				return errors.New("invalid node P2P port")
+			}
+		}
+		cfg.NodeP2PPort = nodeP2PPort
+
+		nodeBootnodes := strings.TrimSpace(nodeBootnodesEntry.Text)
+		if nodeBootnodes == "" {
+			nodeBootnodes = defaultNodeBootnodes
+		}
+		cfg.NodeBootnodes = nodeBootnodes
+
+		nodeVerbosity := defaultNodeVerbosity
+		if strings.TrimSpace(nodeVerbosityEntry.Text) != "" {
+			nodeVerbosity, err = strconv.Atoi(strings.TrimSpace(nodeVerbosityEntry.Text))
+			if err != nil || nodeVerbosity < 0 || nodeVerbosity > 5 {
+				return errors.New("invalid node verbosity (0..5)")
+			}
+		}
+		cfg.NodeVerbosity = nodeVerbosity
+		nodeEtherbase := strings.TrimSpace(nodeEtherbaseEntry.Text)
+		if nodeEtherbase != "" && !isHexAddress(nodeEtherbase) {
+			if cfg.NodeEnabled {
+				return errors.New("invalid node mining address (expected 0x + 40 hex chars)")
+			}
+			cfg.NodeEtherbase = ""
+		} else if isHexAddress(nodeEtherbase) {
+			cfg.NodeEtherbase = strings.ToLower(nodeEtherbase)
+		} else {
+			cfg.NodeEtherbase = ""
+		}
+
+		cfg.WatchdogEnabled = watchdogEnabledCheck.Checked
+		if text := strings.TrimSpace(watchdogNoJobEntry.Text); text != "" {
+			if v, err := strconv.Atoi(text); err == nil && v >= 5 && v <= 3600 {
+				cfg.WatchdogNoJobTimeoutSec = v
+			} else if cfg.WatchdogEnabled {
+				return errors.New("invalid watchdog no-job timeout (5..3600 seconds)")
+			}
+		}
+		if text := strings.TrimSpace(watchdogRestartDelayEntry.Text); text != "" {
+			if v, err := strconv.Atoi(text); err == nil && v >= 1 && v <= 600 {
+				cfg.WatchdogRestartDelaySec = v
+			} else if cfg.WatchdogEnabled {
+				return errors.New("invalid watchdog restart delay (1..600 seconds)")
+			}
+		}
+		if text := strings.TrimSpace(watchdogRetryWindowEntry.Text); text != "" {
+			if v, err := strconv.Atoi(text); err == nil && v >= 1 && v <= 1440 {
+				cfg.WatchdogRetryWindowMin = v
+			} else if cfg.WatchdogEnabled {
+				return errors.New("invalid watchdog retry window (1..1440 minutes)")
+			}
+		}
 		return saveConfig(cfg)
 	}
 
@@ -941,40 +1434,575 @@ func main() {
 		devMu.Unlock()
 		cfg.SelectedDevices = selected
 
+		cfg.NodeEnabled = nodeEnabledCheck.Checked
+		cfg.NodeMode = selectedNodeMode()
+
+		cfg.NodeDataDir = strings.TrimSpace(nodeDataDirEntry.Text)
+
+		if portText := strings.TrimSpace(nodeRPCPortEntry.Text); portText != "" {
+			if port, err := strconv.Atoi(portText); err == nil && port >= 1 && port <= 65535 {
+				cfg.NodeRPCPort = port
+			}
+		} else if cfg.NodeRPCPort == 0 {
+			cfg.NodeRPCPort = defaultNodeRPCPort
+		}
+
+		if portText := strings.TrimSpace(nodeP2PPortEntry.Text); portText != "" {
+			if port, err := strconv.Atoi(portText); err == nil && port >= 1 && port <= 65535 {
+				cfg.NodeP2PPort = port
+			}
+		} else if cfg.NodeP2PPort == 0 {
+			cfg.NodeP2PPort = defaultNodeP2PPort
+		}
+
+		if bootnodes := strings.TrimSpace(nodeBootnodesEntry.Text); bootnodes != "" {
+			cfg.NodeBootnodes = bootnodes
+		} else if cfg.NodeBootnodes == "" {
+			cfg.NodeBootnodes = defaultNodeBootnodes
+		}
+
+		if vText := strings.TrimSpace(nodeVerbosityEntry.Text); vText != "" {
+			if v, err := strconv.Atoi(vText); err == nil && v >= 0 && v <= 5 {
+				cfg.NodeVerbosity = v
+			}
+		} else if cfg.NodeVerbosity == 0 {
+			cfg.NodeVerbosity = defaultNodeVerbosity
+		}
+
+		if wallet := strings.TrimSpace(nodeEtherbaseEntry.Text); isHexAddress(wallet) {
+			cfg.NodeEtherbase = strings.ToLower(wallet)
+		} else if wallet == "" {
+			cfg.NodeEtherbase = ""
+		}
+
+		cfg.WatchdogEnabled = watchdogEnabledCheck.Checked
+		if text := strings.TrimSpace(watchdogNoJobEntry.Text); text != "" {
+			if v, err := strconv.Atoi(text); err == nil && v >= 5 && v <= 3600 {
+				cfg.WatchdogNoJobTimeoutSec = v
+			}
+		}
+		if text := strings.TrimSpace(watchdogRestartDelayEntry.Text); text != "" {
+			if v, err := strconv.Atoi(text); err == nil && v >= 1 && v <= 600 {
+				cfg.WatchdogRestartDelaySec = v
+			}
+		}
+		if text := strings.TrimSpace(watchdogRetryWindowEntry.Text); text != "" {
+			if v, err := strconv.Atoi(text); err == nil && v >= 1 && v <= 1440 {
+				cfg.WatchdogRetryWindowMin = v
+			}
+		}
+
 		_ = saveConfig(cfg)
 	}
 
-	startMiner := func() {
-		if ethminerErr != nil {
-			dialog.ShowError(fmt.Errorf("ethminer not found: %w", ethminerErr), w)
-			return
+	type nodeStartSettings struct {
+		Enabled   bool
+		Mode      string
+		DataDir   string
+		RPCPort   int
+		P2PPort   int
+		Bootnodes string
+		Verbosity int
+		Wallet    string
+	}
+
+	snapshotNodeConfigFromUI := func(requireMiningService bool) (nodeStartSettings, error) {
+		var err error
+		settings := nodeStartSettings{
+			Enabled: nodeEnabledCheck.Checked,
+			Mode:    selectedNodeMode(),
 		}
-		if err := saveFromUI(); err != nil {
-			dialog.ShowError(err, w)
-			return
+
+		settings.DataDir = strings.TrimSpace(nodeDataDirEntry.Text)
+
+		nodeRPCPort := defaultNodeRPCPort
+		if strings.TrimSpace(nodeRPCPortEntry.Text) != "" {
+			nodeRPCPort, err = strconv.Atoi(strings.TrimSpace(nodeRPCPortEntry.Text))
+			if err != nil || nodeRPCPort < 1 || nodeRPCPort > 65535 {
+				return settings, errors.New("invalid node RPC port")
+			}
+		}
+		settings.RPCPort = nodeRPCPort
+
+		nodeP2PPort := defaultNodeP2PPort
+		if strings.TrimSpace(nodeP2PPortEntry.Text) != "" {
+			nodeP2PPort, err = strconv.Atoi(strings.TrimSpace(nodeP2PPortEntry.Text))
+			if err != nil || nodeP2PPort < 1 || nodeP2PPort > 65535 {
+				return settings, errors.New("invalid node P2P port")
+			}
+		}
+		settings.P2PPort = nodeP2PPort
+
+		nodeBootnodes := strings.TrimSpace(nodeBootnodesEntry.Text)
+		if nodeBootnodes == "" {
+			nodeBootnodes = defaultNodeBootnodes
+		}
+		settings.Bootnodes = nodeBootnodes
+
+		nodeVerbosity := defaultNodeVerbosity
+		if strings.TrimSpace(nodeVerbosityEntry.Text) != "" {
+			nodeVerbosity, err = strconv.Atoi(strings.TrimSpace(nodeVerbosityEntry.Text))
+			if err != nil || nodeVerbosity < 0 || nodeVerbosity > 5 {
+				return settings, errors.New("invalid node verbosity (0..5)")
+			}
+		}
+		settings.Verbosity = nodeVerbosity
+
+		wallet := strings.TrimSpace(nodeEtherbaseEntry.Text)
+		if wallet == "" {
+			wallet = strings.TrimSpace(walletEntry.Text)
+		}
+		if settings.Enabled && (settings.Mode == nodeModeMine || requireMiningService) {
+			if !isHexAddress(wallet) {
+				return settings, errors.New("mining address is required for node mining (expected 0x + 40 hex chars)")
+			}
+			settings.Wallet = strings.ToLower(wallet)
+		} else if isHexAddress(wallet) {
+			settings.Wallet = strings.ToLower(wallet)
+		}
+
+		cfg.NodeEnabled = settings.Enabled
+		cfg.NodeMode = settings.Mode
+		cfg.NodeDataDir = settings.DataDir
+		cfg.NodeRPCPort = settings.RPCPort
+		cfg.NodeP2PPort = settings.P2PPort
+		cfg.NodeBootnodes = settings.Bootnodes
+		cfg.NodeVerbosity = settings.Verbosity
+		if etherbase := strings.TrimSpace(nodeEtherbaseEntry.Text); isHexAddress(etherbase) {
+			cfg.NodeEtherbase = strings.ToLower(etherbase)
+		} else {
+			cfg.NodeEtherbase = ""
+		}
+		return settings, saveConfig(cfg)
+	}
+
+	setNodeButtons := func(running bool) {
+		if nodeStartBtn != nil {
+			if running || !nodeEnabledCheck.Checked {
+				nodeStartBtn.Disable()
+			} else {
+				nodeStartBtn.Enable()
+			}
+		}
+		if nodeStopBtn != nil {
+			if running {
+				nodeStopBtn.Enable()
+			} else {
+				nodeStopBtn.Disable()
+			}
+		}
+	}
+
+	startNodeWithSettings := func(settings nodeStartSettings, requireMiningService bool) error {
+		procMu.Lock()
+		if nodeCmd != nil && nodeCmd.Process != nil {
+			procMu.Unlock()
+			return nil
+		}
+		procMu.Unlock()
+
+		gethPath, err := findGeth()
+		if err != nil {
+			return fmt.Errorf("geth not found: %w", err)
+		}
+		genesisPath, err := ensureGenesisFile()
+		if err != nil {
+			return fmt.Errorf("failed to prepare genesis file: %w", err)
+		}
+
+		dataDir := strings.TrimSpace(settings.DataDir)
+		if dataDir == "" {
+			dataDir = defaultNodeDataDir()
+		}
+		if dataDir == "" {
+			return errors.New("node data directory is required")
+		}
+		if err := os.MkdirAll(dataDir, 0o755); err != nil {
+			return err
+		}
+
+		if !isGethInitialized(dataDir) {
+			appendNodeLog("\n[node] Initializing chain data...\n")
+			out, err := runGethInit(gethPath, dataDir, genesisPath)
+			if strings.TrimSpace(out) != "" {
+				appendNodeLog(out + "\n")
+			}
+			if err != nil {
+				return err
+			}
+		}
+
+		effectiveMode := settings.Mode
+		if requireMiningService {
+			effectiveMode = nodeModeMine
+		}
+
+		args := []string{
+			"--datadir", dataDir,
+			"--http", "--http.addr", "127.0.0.1", "--http.port", strconv.Itoa(settings.RPCPort),
+			"--http.api", "eth,net,web3,miner,olivetumhash,olivetum",
+			"--port", strconv.Itoa(settings.P2PPort),
+			"--syncmode", "snap",
+			"--gcmode", "full",
+			"--bootnodes", strings.TrimSpace(settings.Bootnodes),
+			"--verbosity", strconv.Itoa(settings.Verbosity),
+		}
+		if effectiveMode == nodeModeMine {
+			if !isHexAddress(settings.Wallet) {
+				return errors.New("wallet address is required for node mining")
+			}
+			args = append(args,
+				"--mine",
+				"--miner.threads", "1",
+				"--miner.recommit=1s",
+				"--miner.etherbase", settings.Wallet,
+			)
+		}
+
+		nodeCtx, nodeCancel = context.WithCancel(context.Background())
+		cmd := exec.CommandContext(nodeCtx, gethPath, args...)
+		configureChildProcess(cmd)
+		cmd.Env = append(os.Environ(), "LC_ALL=C")
+
+		stdout, _ := cmd.StdoutPipe()
+		stderr, _ := cmd.StderrPipe()
+
+		appendNodeLog(fmt.Sprintf("\nStarting node: %s %s\n\n", gethPath, strings.Join(args, " ")))
+		if err := cmd.Start(); err != nil {
+			nodeCancel()
+			nodeCtx = nil
+			nodeCancel = nil
+			fyne.Do(func() {
+				setNodeBadge("Node: Off", connOfflineColor)
+				setNodeButtons(false)
+			})
+			return err
 		}
 
 		procMu.Lock()
+		nodeCmd = cmd
+		nodeRunMode = effectiveMode
+		procMu.Unlock()
+
+		go streamLines(stdout, appendNodeLog)
+		go streamLines(stderr, appendNodeLog)
+
+		go func(ctx context.Context, port int) {
+			ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			defer cancel()
+			ticker := time.NewTicker(500 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 750*time.Millisecond)
+				if err == nil {
+					_ = conn.Close()
+					fyne.Do(func() { setNodeBadge("Node: Running", connLiveColor) })
+					return
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+				}
+			}
+		}(nodeCtx, settings.RPCPort)
+
+		go func() {
+			err := cmd.Wait()
+			procMu.Lock()
+			nodeCmd = nil
+			nodeRunMode = ""
+			if nodeCancel != nil {
+				nodeCancel()
+				nodeCancel = nil
+			}
+			procMu.Unlock()
+
+			fyne.Do(func() {
+				setNodeBadge("Node: Off", connOfflineColor)
+				setNodeButtons(false)
+			})
+			if err != nil && !errors.Is(err, context.Canceled) {
+				appendNodeLog(fmt.Sprintf("\n[node exit] %v\n", err))
+			} else {
+				appendNodeLog("\n[node exit] node stopped\n")
+			}
+		}()
+		return nil
+	}
+
+	startNodeAsync := func(requireMiningService bool) error {
+		settings, err := snapshotNodeConfigFromUI(requireMiningService)
+		if err != nil {
+			return err
+		}
+		if !settings.Enabled {
+			return errors.New("node is disabled")
+		}
+
+		procMu.Lock()
+		alreadyRunning := nodeCmd != nil && nodeCmd.Process != nil
+		runningMode := nodeRunMode
+		procMu.Unlock()
+		if alreadyRunning {
+			if requireMiningService && runningMode != nodeModeMine {
+				return errors.New("node is running without mining service enabled; stop the node and start it again with mining enabled")
+			}
+			return nil
+		}
+
+		setNodeBadge("Node: Starting", connConnectingColor)
+		setNodeButtons(true)
+		go func(settings nodeStartSettings) {
+			if err := startNodeWithSettings(settings, requireMiningService); err != nil {
+				fyne.Do(func() {
+					setNodeBadge("Node: Off", connOfflineColor)
+					setNodeButtons(false)
+					dialog.ShowError(err, w)
+				})
+			}
+		}(settings)
+		return nil
+	}
+
+	stopNode := func() {
+		procMu.Lock()
 		defer procMu.Unlock()
-		if minerCmd != nil && minerCmd.Process != nil {
-			dialog.ShowInformation(appName, "Miner already running", w)
+		if nodeCmd == nil || nodeCmd.Process == nil {
 			return
+		}
+		appendNodeLog("\nStopping node...\n")
+		cmd := nodeCmd
+		proc := nodeCmd.Process
+		_ = proc.Signal(os.Interrupt)
+		go func(cmd *exec.Cmd, p *os.Process) {
+			time.Sleep(5 * time.Second)
+			procMu.Lock()
+			still := nodeCmd == cmd
+			procMu.Unlock()
+			if still {
+				_ = p.Kill()
+			}
+		}(cmd, proc)
+	}
+
+	type minerStartOrigin int
+
+	const (
+		minerStartOriginUser minerStartOrigin = iota
+		minerStartOriginWatchdog
+	)
+
+	type minerStopOrigin int
+
+	const (
+		minerStopOriginUser minerStopOrigin = iota
+		minerStopOriginWatchdog
+	)
+
+	type watchdogSettings struct {
+		NoJobTimeout time.Duration
+		RestartDelay time.Duration
+		RetryWindow  time.Duration
+	}
+
+	stopWatchdogSession := func() {
+		procMu.Lock()
+		cancel := watchdogCancel
+		watchdogCancel = nil
+		watchdogRestarting.Store(false)
+		procMu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+	}
+
+	var startMinerWithOrigin func(origin minerStartOrigin) error
+	var stopMinerWithOrigin func(origin minerStopOrigin)
+
+	waitForMinerExit := func(ctx context.Context, timeout time.Duration) bool {
+		deadline := time.Now().Add(timeout)
+		for {
+			procMu.Lock()
+			running := minerCmd != nil && minerCmd.Process != nil
+			procMu.Unlock()
+			if !running {
+				return true
+			}
+			if time.Now().After(deadline) {
+				return false
+			}
+			select {
+			case <-ctx.Done():
+				return false
+			case <-time.After(200 * time.Millisecond):
+			}
+		}
+	}
+
+	startWatchdogSession := func(settings watchdogSettings) {
+		procMu.Lock()
+		if watchdogCancel != nil {
+			procMu.Unlock()
+			return
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		watchdogCancel = cancel
+		procMu.Unlock()
+
+		appendMinerLog(fmt.Sprintf("[watchdog] Enabled (no-job %s, retry %s)\n",
+			settings.NoJobTimeout, settings.RetryWindow))
+
+		go func() {
+			ticker := time.NewTicker(2 * time.Second)
+			defer ticker.Stop()
+
+			var (
+				outageStart  time.Time
+				lastSeenJob  int64
+				restartCount int
+			)
+
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+				}
+
+				jobAt := lastJobAt.Load()
+				if jobAt != 0 && jobAt != lastSeenJob {
+					lastSeenJob = jobAt
+					outageStart = time.Time{}
+					restartCount = 0
+					continue
+				}
+
+				refAt := jobAt
+				if refAt == 0 {
+					refAt = minerStartedAt.Load()
+				}
+				if refAt == 0 {
+					refAt = time.Now().UnixNano()
+				}
+				elapsed := time.Since(time.Unix(0, refAt))
+				if elapsed <= settings.NoJobTimeout {
+					continue
+				}
+
+				if outageStart.IsZero() {
+					outageStart = time.Now()
+				}
+				if settings.RetryWindow > 0 && time.Since(outageStart) > settings.RetryWindow {
+					appendMinerLog(fmt.Sprintf("[watchdog] No jobs for %s (retry window reached). Stopping miner.\n", elapsed))
+					stopMinerWithOrigin(minerStopOriginUser)
+					return
+				}
+
+				if !watchdogRestarting.CompareAndSwap(false, true) {
+					continue
+				}
+				restartCount++
+				appendMinerLog(fmt.Sprintf("[watchdog] No jobs for %s. Restarting miner (attempt %d).\n", elapsed, restartCount))
+
+				stopMinerWithOrigin(minerStopOriginWatchdog)
+				_ = waitForMinerExit(ctx, 25*time.Second)
+
+				select {
+				case <-ctx.Done():
+					watchdogRestarting.Store(false)
+					return
+				case <-time.After(settings.RestartDelay):
+				}
+
+				minerStartedAt.Store(time.Now().UnixNano())
+				lastJobAt.Store(0)
+				currentJobBlock.Store(0)
+
+				if ctx.Err() != nil {
+					watchdogRestarting.Store(false)
+					return
+				}
+
+				startErrCh := make(chan error, 1)
+				fyne.Do(func() {
+					if ctx.Err() != nil {
+						startErrCh <- ctx.Err()
+						return
+					}
+					startErrCh <- startMinerWithOrigin(minerStartOriginWatchdog)
+				})
+				if err := <-startErrCh; err != nil {
+					appendMinerLog(fmt.Sprintf("[watchdog] Restart failed: %v\n", err))
+				}
+				watchdogRestarting.Store(false)
+			}
+		}()
+	}
+
+	errMinerAlreadyRunning := errors.New("miner already running")
+
+	stopMinerWithOrigin = func(origin minerStopOrigin) {
+		if origin == minerStopOriginUser {
+			stopWatchdogSession()
+		}
+		procMu.Lock()
+		defer procMu.Unlock()
+		if minerCmd == nil || minerCmd.Process == nil {
+			return
+		}
+		appendMinerLog("\nStopping miner...\n")
+		cmd := minerCmd
+		proc := minerCmd.Process
+		_ = proc.Signal(os.Interrupt)
+		go func(cmd *exec.Cmd, p *os.Process) {
+			time.Sleep(5 * time.Second)
+			procMu.Lock()
+			still := minerCmd == cmd
+			procMu.Unlock()
+			if still {
+				_ = p.Kill()
+			}
+		}(cmd, proc)
+	}
+
+	startMinerWithOrigin = func(origin minerStartOrigin) error {
+		if ethminerErr != nil {
+			return fmt.Errorf("ethminer not found: %w", ethminerErr)
+		}
+		if origin == minerStartOriginUser {
+			if err := saveFromUI(); err != nil {
+				return err
+			}
+		}
+
+		if cfg.NodeEnabled {
+			requireMiningService := cfg.Mode == modeRPCLocal
+			if err := startNodeAsync(requireMiningService); err != nil {
+				return err
+			}
+		}
+
+		procMu.Lock()
+		if minerCmd != nil && minerCmd.Process != nil {
+			procMu.Unlock()
+			return errMinerAlreadyRunning
 		}
 
 		port, err := pickFreePort()
 		if err != nil {
-			dialog.ShowError(err, w)
-			return
+			procMu.Unlock()
+			return err
 		}
 		apiPort = port
 
 		poolURL, err := buildPoolURL(cfg)
 		if err != nil {
-			dialog.ShowError(err, w)
-			return
+			procMu.Unlock()
+			return err
 		}
 
-		backendSelection := selectedBackend()
+		backendSelection := cfg.Backend
 		backend := resolveBackend(ethminerPath, backendSelection)
 		args := []string{
 			"-G",
@@ -1004,6 +2032,12 @@ func main() {
 			}
 		}
 
+		minerStartedAt.Store(time.Now().UnixNano())
+		lastJobAt.Store(0)
+		currentJobBlock.Store(0)
+		lastFoundBlock.Store(0)
+		jobDifficulty.Store("")
+
 		minerCtx, minerCancel = context.WithCancel(context.Background())
 		cmd := exec.CommandContext(minerCtx, ethminerPath, args...)
 		configureChildProcess(cmd)
@@ -1012,19 +2046,24 @@ func main() {
 		stdout, _ := cmd.StdoutPipe()
 		stderr, _ := cmd.StderrPipe()
 
-		resetLog()
-		appendLog(fmt.Sprintf("Starting: %s %s\n\n", ethminerPath, strings.Join(args, " ")))
+		resetMinerLog()
+		appendMinerLog(fmt.Sprintf("Starting: %s %s\n\n", ethminerPath, strings.Join(args, " ")))
 
 		if err := cmd.Start(); err != nil {
 			minerCancel()
 			minerCtx = nil
 			minerCancel = nil
-			dialog.ShowError(err, w)
-			return
+			procMu.Unlock()
+			return err
 		}
 		minerCmd = cmd
 		waitingForStats.Store(true)
 		lastAccepted.Store(0)
+
+		pollCtx, pollCancelFn := context.WithCancel(context.Background())
+		pollCancel = pollCancelFn
+		procMu.Unlock()
+
 		setRunningUI(true)
 		if backendSelection == backendAuto {
 			backendInUseValue.SetText(fmt.Sprintf("Auto → %s", strings.ToUpper(backend)))
@@ -1032,15 +2071,33 @@ func main() {
 			backendInUseValue.SetText(strings.ToUpper(backend))
 		}
 
-		go streamLines(stdout, appendLog)
-		go streamLines(stderr, appendLog)
+		if origin == minerStartOriginUser && cfg.WatchdogEnabled {
+			startWatchdogSession(watchdogSettings{
+				NoJobTimeout: time.Duration(cfg.WatchdogNoJobTimeoutSec) * time.Second,
+				RestartDelay: time.Duration(cfg.WatchdogRestartDelaySec) * time.Second,
+				RetryWindow:  time.Duration(cfg.WatchdogRetryWindowMin) * time.Minute,
+			})
+		}
 
-		ctx, cancel := context.WithCancel(context.Background())
-		pollCancel = cancel
-		go pollStats(ctx, "127.0.0.1", apiPort, cfg.HWMon, func(s Stat) {
+		go streamLines(stdout, appendMinerLog)
+		go streamLines(stderr, appendMinerLog)
+
+		go pollStats(pollCtx, "127.0.0.1", apiPort, cfg.HWMon, func(s Stat) {
 			firstStat := waitingForStats.Swap(false)
 			prevAccepted := lastAccepted.Swap(s.Accepted)
 			hasNewAccept := s.Accepted > prevAccepted
+			if s.Difficulty > 0 {
+				jobDifficulty.Store(formatDifficulty(s.Difficulty))
+			}
+			updateLastFoundFromAccept := true
+			if cfg.Mode == modeRPCLocal && cfg.NodeEnabled {
+				updateLastFoundFromAccept = false
+			}
+			if hasNewAccept && updateLastFoundFromAccept {
+				if block := currentJobBlock.Load(); block > 0 {
+					lastFoundBlock.Store(block)
+				}
+			}
 			statCopy := s
 			statCopy.PerGPU_KHs = append([]int64(nil), s.PerGPU_KHs...)
 			statCopy.PerGPU_Power = append([]float64(nil), s.PerGPU_Power...)
@@ -1069,11 +2126,26 @@ func main() {
 				}
 				poolValue.SetText(s.Pool)
 				uptimeValue.SetText(fmt.Sprintf("%d min", s.UptimeMin))
+				if block := currentJobBlock.Load(); block > 0 {
+					currentBlockValue.SetText(fmt.Sprintf("%d", block))
+				} else {
+					currentBlockValue.SetText("—")
+				}
+				if diff, ok := jobDifficulty.Load().(string); ok && strings.TrimSpace(diff) != "" {
+					currentDifficultyValue.SetText(diff)
+				} else {
+					currentDifficultyValue.SetText("—")
+				}
+				if block := lastFoundBlock.Load(); block > 0 {
+					lastFoundBlockValue.SetText(fmt.Sprintf("%d", block))
+				} else {
+					lastFoundBlockValue.SetText("—")
+				}
 				updateStatsTable(statCopy)
 			})
 		}, func(err error) {
 			// Only show transient failures in log; API might not be ready yet.
-			appendLog(fmt.Sprintf("[api] %v\n", err))
+			appendMinerLog(fmt.Sprintf("[api] %v\n", err))
 		})
 
 		go func() {
@@ -1092,38 +2164,42 @@ func main() {
 
 			fyne.Do(func() { setRunningUI(false) })
 			if err != nil && !errors.Is(err, context.Canceled) {
-				appendLog(fmt.Sprintf("\n[exit] %v\n", err))
+				appendMinerLog(fmt.Sprintf("\n[exit] %v\n", err))
 			} else {
-				appendLog("\n[exit] miner stopped\n")
+				appendMinerLog("\n[exit] miner stopped\n")
 			}
 		}()
+		return nil
 	}
 
-	stopMiner := func() {
-		procMu.Lock()
-		defer procMu.Unlock()
-		if minerCmd == nil || minerCmd.Process == nil {
+	startMinerUser := func() {
+		err := startMinerWithOrigin(minerStartOriginUser)
+		if err == nil {
 			return
 		}
-		appendLog("\nStopping miner...\n")
-		cmd := minerCmd
-		proc := minerCmd.Process
-		_ = proc.Signal(os.Interrupt)
-		// Fallback hard kill after a short grace (only if it's still the same process).
-		go func(cmd *exec.Cmd, p *os.Process) {
-			time.Sleep(5 * time.Second)
-			procMu.Lock()
-			still := minerCmd == cmd
-			procMu.Unlock()
-			if still {
-				_ = p.Kill()
-			}
-		}(cmd, proc)
+		if errors.Is(err, errMinerAlreadyRunning) {
+			dialog.ShowInformation(appName, "Miner already running", w)
+			return
+		}
+		dialog.ShowError(err, w)
 	}
 
-	startBtn = widget.NewButtonWithIcon("Start mining", theme.MediaPlayIcon(), startMiner)
+	stopMinerUser := func() {
+		stopMinerWithOrigin(minerStopOriginUser)
+	}
+
+	nodeStartBtn = widget.NewButtonWithIcon("Start node", theme.MediaPlayIcon(), func() {
+		if err := startNodeAsync(false); err != nil {
+			dialog.ShowError(err, w)
+		}
+	})
+	nodeStartBtn.Importance = widget.HighImportance
+	nodeStopBtn = widget.NewButtonWithIcon("Stop node", theme.MediaStopIcon(), stopNode)
+	nodeStopBtn.Importance = widget.DangerImportance
+
+	startBtn = widget.NewButtonWithIcon("Start mining", theme.MediaPlayIcon(), startMinerUser)
 	startBtn.Importance = widget.HighImportance
-	stopBtn = widget.NewButtonWithIcon("Stop", theme.MediaStopIcon(), stopMiner)
+	stopBtn = widget.NewButtonWithIcon("Stop", theme.MediaStopIcon(), stopMinerUser)
 	stopBtn.Importance = widget.DangerImportance
 
 	if ethminerErr != nil {
@@ -1132,6 +2208,8 @@ func main() {
 	} else {
 		stopBtn.Disable()
 	}
+
+	setNodeButtons(false)
 
 	devicesScroll := container.NewVScroll(devicesBox)
 	devicesScroll.SetMinSize(fyne.NewSize(0, 240))
@@ -1145,6 +2223,101 @@ func main() {
 		rpcRow,
 	)
 	connectionPanel := panel("Connection", connectionBody)
+
+	nodeDataDirBrowseBtn := widget.NewButtonWithIcon("Browse", theme.FolderOpenIcon(), func() {
+		dialog.ShowFolderOpen(func(listable fyne.ListableURI, err error) {
+			if err != nil {
+				dialog.ShowError(err, w)
+				return
+			}
+			if listable == nil {
+				return
+			}
+			nodeDataDirEntry.SetText(listable.Path())
+		}, w)
+	})
+	nodeDataDirField := container.NewBorder(nil, nil, nil, nodeDataDirBrowseBtn, nodeDataDirEntry)
+	nodeModeRow := formRow("Node mode", nodeModeSelect)
+	nodeDataDirRow := formRow("Data directory", nodeDataDirField)
+	nodePortsGrid := container.NewGridWithColumns(2,
+		fieldLabel("RPC port"), nodeRPCPortEntry,
+		fieldLabel("P2P port"), nodeP2PPortEntry,
+		fieldLabel("Verbosity"), nodeVerbosityEntry,
+	)
+	nodeAdvancedBody := container.NewVBox(
+		nodePortsGrid,
+		formRow("Bootnodes", nodeBootnodesEntry),
+	)
+	nodeAdvanced := widget.NewAccordion(widget.NewAccordionItem("Advanced", nodeAdvancedBody))
+	nodeAdvanced.CloseAll()
+
+	nodeHint := widget.NewLabel("Tip: For the embedded node, use RPC URL http://127.0.0.1:8545 (or your configured RPC port). For external nodes, disable Run a node and enter your RPC URL.")
+	nodeHint.Wrapping = fyne.TextWrapWord
+	nodeHint.TextStyle = fyne.TextStyle{Italic: true}
+
+	nodeEtherbaseRow := formRow("Mining address", nodeEtherbaseEntry)
+	nodeEtherbaseHint := widget.NewLabel("Used as --miner.etherbase when the mining service is enabled. Leave empty to reuse Wallet from Connection.")
+	nodeEtherbaseHint.Wrapping = fyne.TextWrapWord
+	nodeEtherbaseHint.TextStyle = fyne.TextStyle{Italic: true}
+
+	watchdogGrid := container.NewGridWithColumns(2,
+		fieldLabel("No-job timeout (s)"), watchdogNoJobEntry,
+		fieldLabel("Restart delay (s)"), watchdogRestartDelayEntry,
+		fieldLabel("Retry window (min)"), watchdogRetryWindowEntry,
+	)
+	watchdogHint := widget.NewLabel("Restarts the miner if it stops receiving new jobs. Useful for unstable connections or pool issues.")
+	watchdogHint.Wrapping = fyne.TextWrapWord
+	watchdogHint.TextStyle = fyne.TextStyle{Italic: true}
+	watchdogFields := container.NewVBox(watchdogGrid, watchdogHint)
+	if !watchdogEnabledCheck.Checked {
+		watchdogFields.Hide()
+	}
+	watchdogEnabledCheck.OnChanged = func(enabled bool) {
+		if enabled {
+			watchdogFields.Show()
+		} else {
+			watchdogFields.Hide()
+		}
+	}
+
+	nodeButtonsRow := container.NewHBox(nodeStartBtn, layout.NewSpacer(), nodeStopBtn)
+
+	nodeSettingsBox := container.NewVBox(
+		nodeHint,
+		nodeModeRow,
+		nodeEtherbaseRow,
+		nodeEtherbaseHint,
+		nodeDataDirRow,
+		nodeAdvanced,
+		nodeButtonsRow,
+	)
+	if !nodeEnabledCheck.Checked {
+		nodeSettingsBox.Hide()
+	}
+	nodeEnabledCheck.OnChanged = func(enabled bool) {
+		if enabled {
+			nodeSettingsBox.Show()
+		} else {
+			nodeSettingsBox.Hide()
+		}
+		procMu.Lock()
+		running := nodeCmd != nil && nodeCmd.Process != nil
+		procMu.Unlock()
+		setNodeButtons(running)
+		applyModeUI()
+	}
+
+	nodeBody := container.NewVBox(
+		nodeEnabledCheck,
+		nodeSettingsBox,
+	)
+	nodePanel := panel("Node", nodeBody)
+
+	watchdogBody := container.NewVBox(
+		watchdogEnabledCheck,
+		watchdogFields,
+	)
+	watchdogPanel := panel("Watchdog", watchdogBody)
 
 	hardwareGrid := container.NewGridWithColumns(2,
 		fieldLabel("GPU backend"), backendSelect,
@@ -1162,7 +2335,9 @@ func main() {
 	)
 	hardwarePanel := panel("Hardware", hardwareBody)
 
-	setupSplit := container.NewHSplit(connectionPanel, hardwarePanel)
+	setupLeft := container.NewVBox(connectionPanel, nodePanel, watchdogPanel)
+	setupLeftScroll := container.NewVScroll(setupLeft)
+	setupSplit := container.NewHSplit(setupLeftScroll, hardwarePanel)
 	setupSplit.Offset = 0.52
 	setupTab := container.NewPadded(setupSplit)
 
@@ -1176,33 +2351,92 @@ func main() {
 		sharesTile,
 		metricTileWithIcon("Pool", theme.StorageIcon(), poolValue),
 	)
+	jobRow := container.New(&centeredTileRowLayout{Columns: 4},
+		metricTileWithIcon("Current mining block", iconPickaxeWhite, currentBlockValue),
+		metricTileWithIcon("Difficulty", theme.InfoIcon(), currentDifficultyValue),
+		metricTileWithIcon("Last found", theme.SearchIcon(), lastFoundBlockValue),
+	)
 	overviewBody := container.NewVBox(
 		fieldLabel("Total hashrate"),
 		hashrateValue,
 		overviewGrid,
+		jobRow,
 	)
 	overviewPanel := panel("Overview", overviewBody)
-		hashratePanel := panelWithHeader(hashrate10mHeader, hashrateHistory.Object())
-		statsScroll := container.NewVScroll(statsTable)
-		statsScroll.SetMinSize(fyne.NewSize(0, 220))
-		statsBody := container.NewVBox(statsHeaderRow, widget.NewSeparator(), statsScroll)
-		statsPanel := panel("Per-GPU", statsBody)
-		dashboardStack := container.NewVBox(overviewPanel, hashratePanel, statsPanel)
-		dashboardTab := container.NewPadded(container.NewVScroll(dashboardStack))
+	hashratePanel := panelWithHeader(hashrate10mHeader, hashrateHistory.Object())
+	statsScroll := container.NewVScroll(statsTable)
+	statsScroll.SetMinSize(fyne.NewSize(0, 220))
+	statsBody := container.NewVBox(statsHeaderRow, widget.NewSeparator(), statsScroll)
+	statsPanel := panel("Per-GPU", statsBody)
+	dashboardStack := container.NewVBox(overviewPanel, hashratePanel, statsPanel)
+	dashboardTab := container.NewPadded(container.NewVScroll(dashboardStack))
 
-	clearLogsBtn := widget.NewButtonWithIcon("Clear", theme.ContentClearIcon(), resetLog)
-	logBar := container.NewHBox(followTailCheck, layout.NewSpacer(), clearLogsBtn)
-	logPanel := panel("Logs", container.NewBorder(logBar, nil, nil, nil, logList))
-	logTab := container.NewPadded(logPanel)
-
-		setupItem := container.NewTabItemWithIcon("Setup", theme.SettingsIcon(), setupTab)
-		dashboardItem := container.NewTabItemWithIcon("Dashboard", theme.HomeIcon(), dashboardTab)
-		logsItem := container.NewTabItemWithIcon("Logs", theme.ListIcon(), logTab)
-		tabs := container.NewAppTabs(setupItem, dashboardItem, logsItem)
-		logsTabActive.Store(false)
-		tabs.OnChanged = func(item *container.TabItem) {
-			logsTabActive.Store(item == logsItem)
+	minerLogLines := func() []string {
+		if !minerFollowTailCheck.Checked {
+			minerLogSnapshotMu.RLock()
+			if minerLogSnapshot != nil {
+				out := append([]string(nil), minerLogSnapshot...)
+				minerLogSnapshotMu.RUnlock()
+				return out
+			}
+			minerLogSnapshotMu.RUnlock()
 		}
+		return minerLogBuf.Snapshot()
+	}
+	nodeLogLines := func() []string {
+		if !nodeFollowTailCheck.Checked {
+			nodeLogSnapshotMu.RLock()
+			if nodeLogSnapshot != nil {
+				out := append([]string(nil), nodeLogSnapshot...)
+				nodeLogSnapshotMu.RUnlock()
+				return out
+			}
+			nodeLogSnapshotMu.RUnlock()
+		}
+		return nodeLogBuf.Snapshot()
+	}
+
+	minerCopyLogsBtn := widget.NewButtonWithIcon("Copy", theme.ContentCopyIcon(), func() {
+		w.Clipboard().SetContent(strings.Join(minerLogLines(), "\n"))
+	})
+	minerClearLogsBtn := widget.NewButtonWithIcon("Clear", theme.ContentClearIcon(), resetMinerLog)
+	minerLogBar := container.NewHBox(minerFollowTailCheck, layout.NewSpacer(), minerCopyLogsBtn, minerClearLogsBtn)
+	minerLogPanel := panel("Miner Logs", container.NewBorder(minerLogBar, nil, nil, nil, container.NewPadded(minerLogList)))
+	minerLogTab := container.NewPadded(minerLogPanel)
+
+	nodeCopyLogsBtn := widget.NewButtonWithIcon("Copy", theme.ContentCopyIcon(), func() {
+		w.Clipboard().SetContent(strings.Join(nodeLogLines(), "\n"))
+	})
+	nodeClearLogsBtn := widget.NewButtonWithIcon("Clear", theme.ContentClearIcon(), resetNodeLog)
+	nodeLogBar := container.NewHBox(nodeFollowTailCheck, layout.NewSpacer(), nodeCopyLogsBtn, nodeClearLogsBtn)
+	nodeLogPanel := panel("Node Logs", container.NewBorder(nodeLogBar, nil, nil, nil, container.NewPadded(nodeLogList)))
+	nodeLogTab := container.NewPadded(nodeLogPanel)
+
+	minerLogsItem := container.NewTabItemWithIcon("Miner", theme.ComputerIcon(), minerLogTab)
+	nodeLogsItem := container.NewTabItemWithIcon("Node", theme.StorageIcon(), nodeLogTab)
+	logTabs := container.NewAppTabs(minerLogsItem, nodeLogsItem)
+	logTabs.OnSelected = func(item *container.TabItem) {
+		minerLogsActive.Store(item == minerLogsItem)
+		nodeLogsActive.Store(item == nodeLogsItem)
+	}
+	minerLogsActive.Store(true)
+	nodeLogsActive.Store(false)
+
+	logTab := container.NewPadded(logTabs)
+
+	setupItem := container.NewTabItemWithIcon("Setup", theme.SettingsIcon(), setupTab)
+	dashboardItem := container.NewTabItemWithIcon("Dashboard", theme.HomeIcon(), dashboardTab)
+	logsItem := container.NewTabItemWithIcon("Logs", theme.ListIcon(), logTab)
+	tabs := container.NewAppTabs(setupItem, dashboardItem, logsItem)
+	logsTabActive.Store(false)
+	tabs.OnSelected = func(item *container.TabItem) {
+		logsTabActive.Store(item == logsItem)
+		if item == logsItem {
+			selected := logTabs.Selected()
+			minerLogsActive.Store(selected == minerLogsItem)
+			nodeLogsActive.Store(selected == nodeLogsItem)
+		}
+	}
 
 	headerTitle := canvas.NewText(appName, theme.Color(theme.ColorNamePrimary))
 	headerTitle.TextStyle = fyne.TextStyle{Bold: true}
@@ -1227,6 +2461,7 @@ func main() {
 		return fixedSize(headerTileSize, obj)
 	}
 	headerRight := container.NewHBox(
+		wrapHeaderTile(nodeBadge),
 		wrapHeaderTile(connectionBadge),
 		wrapHeaderTile(statusPill),
 		wrapHeaderTile(startBtn),
@@ -1255,17 +2490,25 @@ func main() {
 
 	w.SetCloseIntercept(func() {
 		procMu.Lock()
-		running := minerCmd != nil && minerCmd.Process != nil
+		minerRunning := minerCmd != nil && minerCmd.Process != nil
+		nodeRunning := nodeCmd != nil && nodeCmd.Process != nil
 		procMu.Unlock()
-		if !running {
+		if !minerRunning && !nodeRunning {
 			saveDraftFromUI()
 			w.Close()
 			return
 		}
-		dialog.ShowConfirm(appName, "Mining is running. Stop and quit?", func(ok bool) {
+		message := "Services are running. Stop and quit?"
+		if minerRunning && !nodeRunning {
+			message = "Mining is running. Stop and quit?"
+		} else if !minerRunning && nodeRunning {
+			message = "Node is running. Stop and quit?"
+		}
+		dialog.ShowConfirm(appName, message, func(ok bool) {
 			if ok {
 				saveDraftFromUI()
-				stopMiner()
+				stopMinerUser()
+				stopNode()
 				time.AfterFunc(500*time.Millisecond, func() {
 					fyne.Do(func() { w.Close() })
 				})
@@ -1274,7 +2517,7 @@ func main() {
 	})
 
 	if runtime.GOOS == "linux" {
-		appendLog("Tip: You can run this as AppImage and launch from desktop.\n")
+		appendMinerLog("Tip: You can run this as AppImage and launch from desktop.\n")
 	}
 	w.ShowAndRun()
 }
@@ -1292,6 +2535,20 @@ func loadConfig() *Config {
 		ReportHashrate:  true,
 		DisplayInterval: 10,
 		HWMon:           false,
+
+		NodeEnabled:   false,
+		NodeMode:      nodeModeSync,
+		NodeDataDir:   "",
+		NodeRPCPort:   defaultNodeRPCPort,
+		NodeP2PPort:   defaultNodeP2PPort,
+		NodeBootnodes: defaultNodeBootnodes,
+		NodeVerbosity: defaultNodeVerbosity,
+		NodeEtherbase: "",
+
+		WatchdogEnabled:         false,
+		WatchdogNoJobTimeoutSec: 120,
+		WatchdogRestartDelaySec: 10,
+		WatchdogRetryWindowMin:  10,
 	}
 	path, err := configPath()
 	if err != nil {
@@ -1326,6 +2583,42 @@ func loadConfig() *Config {
 	if cfg.DisplayInterval == 0 {
 		cfg.DisplayInterval = 10
 	}
+	if cfg.NodeMode != nodeModeSync && cfg.NodeMode != nodeModeMine {
+		cfg.NodeMode = nodeModeSync
+	}
+	if cfg.NodeDataDir != "" {
+		if filepath.Clean(cfg.NodeDataDir) == filepath.Clean(defaultNodeDataDir()) {
+			cfg.NodeDataDir = ""
+		}
+	}
+	if cfg.NodeRPCPort == 0 {
+		cfg.NodeRPCPort = defaultNodeRPCPort
+	}
+	if cfg.NodeP2PPort == 0 {
+		cfg.NodeP2PPort = defaultNodeP2PPort
+	}
+	if cfg.NodeBootnodes == "" {
+		cfg.NodeBootnodes = defaultNodeBootnodes
+	}
+	if cfg.NodeVerbosity == 0 {
+		cfg.NodeVerbosity = defaultNodeVerbosity
+	}
+	if cfg.NodeEtherbase != "" {
+		if !isHexAddress(cfg.NodeEtherbase) {
+			cfg.NodeEtherbase = ""
+		} else {
+			cfg.NodeEtherbase = strings.ToLower(cfg.NodeEtherbase)
+		}
+	}
+	if cfg.WatchdogNoJobTimeoutSec <= 0 {
+		cfg.WatchdogNoJobTimeoutSec = 120
+	}
+	if cfg.WatchdogRestartDelaySec <= 0 {
+		cfg.WatchdogRestartDelaySec = 10
+	}
+	if cfg.WatchdogRetryWindowMin <= 0 {
+		cfg.WatchdogRetryWindowMin = 10
+	}
 	return cfg
 }
 
@@ -1350,6 +2643,14 @@ func configPath() (string, error) {
 		return "", err
 	}
 	return filepath.Join(dir, configDirName, configFileName), nil
+}
+
+func defaultNodeDataDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(home) == "" {
+		return ""
+	}
+	return filepath.Join(home, ".olivetum", "node")
 }
 
 func isHexAddress(s string) bool {
@@ -1462,6 +2763,9 @@ func findEthminer() (string, error) {
 
 var deviceLine = regexp.MustCompile(`^\s*(\d+)\s+(\S+)\s+\S+\s+(.+?)\s+(Yes|No)\s+`)
 var gpuStatLine = regexp.MustCompile(`\b(?:cu|cl)(\d+)\s+(?:[0-9]+(?:\.[0-9]+)?\s+)?(\d+)C\s+(\d+)%\s+([0-9]+(?:\.[0-9]+)?)W\b`)
+var jobBlockLine = regexp.MustCompile(`\bJob:\s+\S+\s+block\s+(\d+)\b`)
+var nodeMinedPotentialBlockLine = regexp.MustCompile(`\bMined potential block\b.*\bnumber=([0-9,]+)\b`)
+var nodeSealedNewBlockLine = regexp.MustCompile(`\bSuccessfully sealed new block\b.*\bnumber=([0-9,]+)\b`)
 
 func resolveBackend(ethminerPath string, backend string) string {
 	if backend != backendAuto {
@@ -1549,9 +2853,10 @@ type deviceSensors struct {
 }
 
 type detailSnapshot struct {
-	Sensors map[int]deviceSensors
-	Labels  map[int]string
-	Hashes  map[int]int64
+	Sensors    map[int]deviceSensors
+	Labels     map[int]string
+	Hashes     map[int]int64
+	Difficulty float64
 }
 
 type statDetail struct {
@@ -1566,14 +2871,19 @@ type statDetail struct {
 			Hashrate string `json:"hashrate"`
 		} `json:"mining"`
 	} `json:"devices"`
+	Mining struct {
+		Difficulty float64 `json:"difficulty"`
+	} `json:"mining"`
 }
 
 func pollStats(ctx context.Context, host string, port int, detail bool, onStat func(Stat), onErr func(error)) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
-	detailEvery := 3
+	detailEvery := 3     // 6s cadence for sensors/hwmon
+	difficultyEvery := 5 // 10s cadence for mining info
 	detailTick := detailEvery - 1
+	difficultyTick := difficultyEvery - 1
 	var cachedDetail detailSnapshot
 
 	for {
@@ -1586,22 +2896,29 @@ func pollStats(ctx context.Context, host string, port int, detail bool, onStat f
 				onErr(err)
 				continue
 			}
-			needDetail := detail || len(st.PerGPU_KHs) == 0
-			if needDetail {
+			needSensors := detail || len(st.PerGPU_KHs) == 0
+			needDetailCall := false
+			if needSensors {
 				detailTick++
 				if detailTick >= detailEvery || (len(cachedDetail.Sensors) == 0 && len(cachedDetail.Hashes) == 0) {
 					detailTick = 0
-					snapshot, err := getStatDetail(host, port)
-					if err != nil {
-						onErr(err)
-					} else {
-						cachedDetail = snapshot
-					}
-				}
-				if len(cachedDetail.Sensors) > 0 || len(cachedDetail.Hashes) > 0 {
-					applyDetail(&st, cachedDetail)
+					needDetailCall = true
 				}
 			}
+			difficultyTick++
+			if difficultyTick >= difficultyEvery || cachedDetail.Difficulty == 0 {
+				difficultyTick = 0
+				needDetailCall = true
+			}
+			if needDetailCall {
+				snapshot, err := getStatDetail(host, port)
+				if err != nil {
+					onErr(err)
+				} else {
+					cachedDetail = snapshot
+				}
+			}
+			applyDetail(&st, cachedDetail)
 			onStat(st)
 		}
 	}
@@ -1707,9 +3024,10 @@ func getStatDetail(host string, port int) (detailSnapshot, error) {
 	}
 
 	snapshot := detailSnapshot{
-		Sensors: make(map[int]deviceSensors),
-		Labels:  make(map[int]string),
-		Hashes:  make(map[int]int64),
+		Sensors:    make(map[int]deviceSensors),
+		Labels:     make(map[int]string),
+		Hashes:     make(map[int]int64),
+		Difficulty: detail.Mining.Difficulty,
 	}
 	for _, dev := range detail.Devices {
 		temp := 0
@@ -1757,7 +3075,21 @@ func parseHashrateHex(s string) (int64, bool) {
 	return int64(v / 1000), true
 }
 
+func formatDifficulty(diff float64) string {
+	if diff <= 0 {
+		return ""
+	}
+	suffixes := []string{"", "K", "M", "G", "T", "P", "E"}
+	idx := 0
+	for diff >= 1000 && idx < len(suffixes)-1 {
+		diff /= 1000
+		idx++
+	}
+	return fmt.Sprintf("%.2f %sH", diff, suffixes[idx])
+}
+
 func applyDetail(st *Stat, detail detailSnapshot) {
+	st.Difficulty = detail.Difficulty
 	if len(detail.Sensors) == 0 && len(detail.Hashes) == 0 {
 		return
 	}
@@ -1914,4 +3246,17 @@ func (r *ringLogs) At(i int) string {
 		return ""
 	}
 	return r.buf[(r.start+i)%len(r.buf)]
+}
+
+func (r *ringLogs) Snapshot() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.size == 0 || len(r.buf) == 0 {
+		return []string{}
+	}
+	out := make([]string, r.size)
+	for i := 0; i < r.size; i++ {
+		out[i] = r.buf[(r.start+i)%len(r.buf)]
+	}
+	return out
 }
