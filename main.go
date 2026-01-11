@@ -995,10 +995,17 @@ func main() {
 				}
 			}
 			lower := strings.ToLower(line)
-			if strings.Contains(lower, "bad block") || strings.Contains(lower, "unknown ancestor") || strings.Contains(lower, "failed to read") && strings.Contains(lower, "last block") {
+			isChainIssue := strings.Contains(lower, "bad block") ||
+				strings.Contains(lower, "unknown ancestor") ||
+				(strings.Contains(lower, "failed to read") && strings.Contains(lower, "last block")) ||
+				strings.Contains(lower, "missing trie node") ||
+				strings.Contains(lower, "head state missing") ||
+				(strings.Contains(lower, "failed to restore") && strings.Contains(lower, "runtime")) ||
+				(strings.Contains(lower, "retrieved hash chain is invalid") && strings.Contains(lower, "missing parent"))
+			if isChainIssue {
 				if resetNodeDataAndResync != nil && nodeChainIssueDialogShown.CompareAndSwap(false, true) {
 					fyne.Do(func() {
-						msg := widget.NewLabel("Local chain data appears inconsistent (BAD BLOCK / unknown ancestor). A resync is recommended.")
+						msg := widget.NewLabel("Local chain data appears inconsistent or incomplete. A resync is recommended.")
 						msg.Wrapping = fyne.TextWrapWord
 						d := dialog.NewCustomConfirm(appName, "Reset node data & resync", "Dismiss", msg, func(ok bool) {
 							if ok {
@@ -1876,13 +1883,16 @@ func main() {
 		appendNodeLog("\nStopping node...\n")
 		cmd := nodeCmd
 		proc := nodeCmd.Process
-		_ = proc.Signal(os.Interrupt)
+		if err := sendProcessInterrupt(proc); err != nil {
+			appendNodeLog(fmt.Sprintf("[node] interrupt failed: %v\n", err))
+		}
 		go func(cmd *exec.Cmd, p *os.Process) {
 			time.Sleep(60 * time.Second)
 			procMu.Lock()
 			still := nodeCmd == cmd
 			procMu.Unlock()
 			if still {
+				appendNodeLog("[node] Force-killing node (timeout)\n")
 				_ = p.Kill()
 			}
 		}(cmd, proc)
@@ -2172,13 +2182,16 @@ func main() {
 		appendMinerLog("\nStopping miner...\n")
 		cmd := minerCmd
 		proc := minerCmd.Process
-		_ = proc.Signal(os.Interrupt)
+		if err := sendProcessInterrupt(proc); err != nil {
+			appendMinerLog(fmt.Sprintf("[miner] interrupt failed: %v\n", err))
+		}
 		go func(cmd *exec.Cmd, p *os.Process) {
 			time.Sleep(10 * time.Second)
 			procMu.Lock()
 			still := minerCmd == cmd
 			procMu.Unlock()
 			if still {
+				appendMinerLog("[miner] Force-killing miner (timeout)\n")
 				_ = p.Kill()
 			}
 		}(cmd, proc)
