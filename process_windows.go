@@ -10,9 +10,13 @@ import (
 )
 
 func configureChildProcess(cmd *exec.Cmd) {
+	ensureHiddenConsole()
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
 	cmd.SysProcAttr.HideWindow = true
-	cmd.SysProcAttr.CreationFlags |= windows.CREATE_NO_WINDOW
+	if consoleWindow() == 0 {
+		cmd.SysProcAttr.CreationFlags |= windows.CREATE_NO_WINDOW
+	}
+	cmd.SysProcAttr.CreationFlags |= windows.CREATE_NEW_PROCESS_GROUP
 }

@@ -83,3 +83,24 @@ func runGethInit(gethPath, dataDir, genesisPath string) (string, error) {
 	}
 	return outStr, nil
 }
+
+func wipeNodeData(dataDir string) error {
+	dataDir = strings.TrimSpace(dataDir)
+	if dataDir == "" {
+		return errors.New("node data directory is required")
+	}
+	var err error
+	dataDir, err = expandUserPath(dataDir)
+	if err != nil {
+		return err
+	}
+	if dataDir == "" {
+		return errors.New("node data directory is required")
+	}
+	gethDir := filepath.Join(dataDir, "geth")
+	if err := os.RemoveAll(gethDir); err != nil {
+		return err
+	}
+	_ = os.Remove(filepath.Join(dataDir, "geth.ipc"))
+	return nil
+}

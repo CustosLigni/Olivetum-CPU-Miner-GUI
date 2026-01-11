@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"image/color"
 	"io"
+	"math"
 	"net"
 	"net/url"
 	"os"
@@ -72,14 +73,15 @@ type Config struct {
 	DisplayInterval int    `json:"displayInterval"`
 	HWMon           bool   `json:"hwMon"`
 
-	NodeEnabled   bool   `json:"nodeEnabled"`
-	NodeMode      string `json:"nodeMode"`
-	NodeDataDir   string `json:"nodeDataDir"`
-	NodeRPCPort   int    `json:"nodeRpcPort"`
-	NodeP2PPort   int    `json:"nodeP2pPort"`
-	NodeBootnodes string `json:"nodeBootnodes"`
-	NodeVerbosity int    `json:"nodeVerbosity"`
-	NodeEtherbase string `json:"nodeEtherbase"`
+	NodeEnabled    bool   `json:"nodeEnabled"`
+	NodeMode       string `json:"nodeMode"`
+	NodeDataDir    string `json:"nodeDataDir"`
+	NodeRPCPort    int    `json:"nodeRpcPort"`
+	NodeP2PPort    int    `json:"nodeP2pPort"`
+	NodeBootnodes  string `json:"nodeBootnodes"`
+	NodeVerbosity  int    `json:"nodeVerbosity"`
+	NodeEtherbase  string `json:"nodeEtherbase"`
+	NodeCleanStart bool   `json:"nodeCleanStart"`
 
 	WatchdogEnabled         bool `json:"watchdogEnabled"`
 	WatchdogNoJobTimeoutSec int  `json:"watchdogNoJobTimeoutSec"`
@@ -260,6 +262,9 @@ func main() {
 	}
 	nodeVerbosityEntry.SetPlaceHolder(strconv.Itoa(defaultNodeVerbosity))
 
+	nodeCleanStartCheck := widget.NewCheck("Start with clean database (next start)", nil)
+	nodeCleanStartCheck.SetChecked(cfg.NodeCleanStart)
+
 	watchdogEnabledCheck := widget.NewCheck("Enable watchdog (restart miner if jobs stop)", nil)
 	watchdogEnabledCheck.SetChecked(cfg.WatchdogEnabled)
 
@@ -427,6 +432,13 @@ func main() {
 	minerFollowTailCheck.SetChecked(true)
 	nodeFollowTailCheck := widget.NewCheck("Follow tail", nil)
 	nodeFollowTailCheck.SetChecked(true)
+	wrapLogsCheck := widget.NewCheck("Wrap long lines", nil)
+	wrapLogsCheck.SetChecked(true)
+	var wrapLogsEnabled atomic.Bool
+	wrapLogsEnabled.Store(wrapLogsCheck.Checked)
+	logLineHeight := fyne.MeasureText("M", theme.TextSize(), fyne.TextStyle{Monospace: true}).Height
+	baseLogRowHeight := logLineHeight + theme.Padding()*2
+	const maxLogWrapLines = 12
 
 	var (
 		logSensorMu sync.RWMutex
@@ -495,6 +507,7 @@ func main() {
 		dot     *canvas.Circle
 		time    *widget.Label
 		message *widget.Label
+		prefix  fyne.CanvasObject
 	}
 	var logRowRefsByContainer sync.Map
 
@@ -548,12 +561,13 @@ func main() {
 		msg.Wrapping = fyne.TextWrapOff
 		msg.TextStyle = fyne.TextStyle{Monospace: true}
 
-		row := container.NewBorder(nil, nil, container.NewHBox(dotHolder, timeLabel), nil, msg)
-		logRowRefsByContainer.Store(row, &logRowRefs{dot: dot, time: timeLabel, message: msg})
+		prefix := container.NewHBox(dotHolder, timeLabel)
+		row := container.NewBorder(nil, nil, prefix, nil, msg)
+		logRowRefsByContainer.Store(row, &logRowRefs{dot: dot, time: timeLabel, message: msg, prefix: prefix})
 		return row
 	}
 
-	applyLogRow := func(item fyne.CanvasObject, line string) {
+	applyLogRow := func(list *widget.List, id widget.ListItemID, item fyne.CanvasObject, line string) {
 		row, ok := item.(*fyne.Container)
 		if !ok {
 			return
@@ -575,27 +589,76 @@ func main() {
 		} else {
 			refs.time.SetText("")
 		}
+		wrap := wrapLogsEnabled.Load()
+		if wrap {
+			refs.message.Wrapping = fyne.TextWrapBreak
+		} else {
+			refs.message.Wrapping = fyne.TextWrapOff
+		}
 		refs.message.SetText(msg)
+		refs.message.Refresh()
+
+		if list == nil {
+			return
+		}
+
+		height := baseLogRowHeight
+		if wrap && strings.TrimSpace(msg) != "" {
+			rowWidth := item.Size().Width
+			if rowWidth <= 0 {
+				rowWidth = list.Size().Width
+			}
+			availableWidth := rowWidth
+			if refs.prefix != nil {
+				availableWidth -= refs.prefix.MinSize().Width
+			}
+			availableWidth -= theme.Padding() * 2
+			if availableWidth < theme.TextSize()*4 {
+				availableWidth = rowWidth
+			}
+
+			measured := fyne.MeasureText(msg, theme.TextSize(), refs.message.TextStyle)
+			lines := int(math.Ceil(float64(measured.Width) / float64(availableWidth)))
+			if lines < 1 {
+				lines = 1
+			}
+			if lines > maxLogWrapLines {
+				lines = maxLogWrapLines
+			}
+			height = float32(lines)*logLineHeight + theme.Padding()*2
+			if height < baseLogRowHeight {
+				height = baseLogRowHeight
+			}
+		}
+		list.SetItemHeight(id, height)
 	}
 
-	minerLogList := widget.NewList(
+	var minerLogList *widget.List
+	minerLogList = widget.NewList(
 		func() int { return minerLogLen() },
 		func() fyne.CanvasObject {
 			return newLogRow()
 		},
 		func(id widget.ListItemID, item fyne.CanvasObject) {
-			applyLogRow(item, minerLogAt(int(id)))
+			applyLogRow(minerLogList, id, item, minerLogAt(int(id)))
 		},
 	)
-	nodeLogList := widget.NewList(
+	var nodeLogList *widget.List
+	nodeLogList = widget.NewList(
 		func() int { return nodeLogLen() },
 		func() fyne.CanvasObject {
 			return newLogRow()
 		},
 		func(id widget.ListItemID, item fyne.CanvasObject) {
-			applyLogRow(item, nodeLogAt(int(id)))
+			applyLogRow(nodeLogList, id, item, nodeLogAt(int(id)))
 		},
 	)
+
+	wrapLogsCheck.OnChanged = func(enabled bool) {
+		wrapLogsEnabled.Store(enabled)
+		minerLogList.Refresh()
+		nodeLogList.Refresh()
+	}
 
 	minerFollowTailCheck.OnChanged = func(enabled bool) {
 		if enabled {
@@ -850,11 +913,12 @@ func main() {
 	}
 
 	var (
-		minerStartedAt  atomic.Int64
-		lastJobAt       atomic.Int64
-		currentJobBlock atomic.Int64
-		lastFoundBlock  atomic.Int64
-		jobDifficulty   atomic.Value
+		minerStartedAt            atomic.Int64
+		lastJobAt                 atomic.Int64
+		currentJobBlock           atomic.Int64
+		lastFoundBlock            atomic.Int64
+		jobDifficulty             atomic.Value
+		nodeChainIssueDialogShown atomic.Bool
 	)
 	jobDifficulty.Store("")
 
@@ -876,6 +940,8 @@ func main() {
 		default:
 		}
 	}
+
+	var resetNodeDataAndResync func(startAfter bool, requireConfirm bool)
 
 	appendMinerLog := func(text string) {
 		text = sanitizeLogLine(text)
@@ -926,6 +992,23 @@ func main() {
 				if block, err := strconv.ParseInt(n, 10, 64); err == nil && block > 0 {
 					lastFoundBlock.Store(block)
 					fyne.Do(func() { lastFoundBlockValue.SetText(fmt.Sprintf("%d", block)) })
+				}
+			}
+			lower := strings.ToLower(line)
+			if strings.Contains(lower, "bad block") || strings.Contains(lower, "unknown ancestor") || strings.Contains(lower, "failed to read") && strings.Contains(lower, "last block") {
+				if resetNodeDataAndResync != nil && nodeChainIssueDialogShown.CompareAndSwap(false, true) {
+					fyne.Do(func() {
+						msg := widget.NewLabel("Local chain data appears inconsistent (BAD BLOCK / unknown ancestor). A resync is recommended.")
+						msg.Wrapping = fyne.TextWrapWord
+						d := dialog.NewCustomConfirm(appName, "Reset node data & resync", "Dismiss", msg, func(ok bool) {
+							if ok {
+								resetNodeDataAndResync(true, false)
+								return
+							}
+							nodeChainIssueDialogShown.Store(false)
+						}, w)
+						d.Show()
+					})
 				}
 			}
 			select {
@@ -1361,6 +1444,7 @@ func main() {
 		} else {
 			cfg.NodeEtherbase = ""
 		}
+		cfg.NodeCleanStart = nodeCleanStartCheck.Checked
 
 		cfg.WatchdogEnabled = watchdogEnabledCheck.Checked
 		if text := strings.TrimSpace(watchdogNoJobEntry.Text); text != "" {
@@ -1496,21 +1580,23 @@ func main() {
 	}
 
 	type nodeStartSettings struct {
-		Enabled   bool
-		Mode      string
-		DataDir   string
-		RPCPort   int
-		P2PPort   int
-		Bootnodes string
-		Verbosity int
-		Wallet    string
+		Enabled    bool
+		CleanStart bool
+		Mode       string
+		DataDir    string
+		RPCPort    int
+		P2PPort    int
+		Bootnodes  string
+		Verbosity  int
+		Wallet     string
 	}
 
 	snapshotNodeConfigFromUI := func(requireMiningService bool) (nodeStartSettings, error) {
 		var err error
 		settings := nodeStartSettings{
-			Enabled: nodeEnabledCheck.Checked,
-			Mode:    selectedNodeMode(),
+			Enabled:    nodeEnabledCheck.Checked,
+			CleanStart: nodeCleanStartCheck.Checked,
+			Mode:       selectedNodeMode(),
 		}
 
 		settings.DataDir = strings.TrimSpace(nodeDataDirEntry.Text)
@@ -1568,6 +1654,7 @@ func main() {
 		cfg.NodeP2PPort = settings.P2PPort
 		cfg.NodeBootnodes = settings.Bootnodes
 		cfg.NodeVerbosity = settings.Verbosity
+		cfg.NodeCleanStart = settings.CleanStart
 		if etherbase := strings.TrimSpace(nodeEtherbaseEntry.Text); isHexAddress(etherbase) {
 			cfg.NodeEtherbase = strings.ToLower(etherbase)
 		} else {
@@ -1614,11 +1701,26 @@ func main() {
 		if dataDir == "" {
 			dataDir = defaultNodeDataDir()
 		}
+		dataDir, err = expandUserPath(dataDir)
+		if err != nil {
+			return err
+		}
 		if dataDir == "" {
 			return errors.New("node data directory is required")
 		}
 		if err := os.MkdirAll(dataDir, 0o755); err != nil {
 			return err
+		}
+
+		if settings.CleanStart {
+			appendNodeLog("\n[node] Cleaning local chain data...\n")
+			if err := wipeNodeData(dataDir); err != nil {
+				return err
+			}
+			settings.CleanStart = false
+			cfg.NodeCleanStart = false
+			_ = saveConfig(cfg)
+			fyne.Do(func() { nodeCleanStartCheck.SetChecked(false) })
 		}
 
 		if !isGethInitialized(dataDir) {
@@ -1776,7 +1878,7 @@ func main() {
 		proc := nodeCmd.Process
 		_ = proc.Signal(os.Interrupt)
 		go func(cmd *exec.Cmd, p *os.Process) {
-			time.Sleep(5 * time.Second)
+			time.Sleep(60 * time.Second)
 			procMu.Lock()
 			still := nodeCmd == cmd
 			procMu.Unlock()
@@ -1784,6 +1886,122 @@ func main() {
 				_ = p.Kill()
 			}
 		}(cmd, proc)
+	}
+
+	redactPath := func(p string) string {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			return ""
+		}
+		p = filepath.Clean(p)
+		home, err := os.UserHomeDir()
+		if err == nil && home != "" {
+			home = filepath.Clean(home)
+			if strings.HasPrefix(strings.ToLower(p), strings.ToLower(home+string(os.PathSeparator))) || strings.EqualFold(p, home) {
+				rel, err := filepath.Rel(home, p)
+				if err == nil && rel != "" && rel != "." {
+					return filepath.Join("~", rel)
+				}
+				return "~"
+			}
+		}
+		base := filepath.Base(p)
+		dir := filepath.Dir(p)
+		parent := filepath.Base(dir)
+		if parent != "" && parent != "." && parent != string(os.PathSeparator) {
+			return filepath.Join("…", parent, base)
+		}
+		return filepath.Join("…", base)
+	}
+
+	resetNodeDataAndResync = func(startAfter bool, requireConfirm bool) {
+		if !nodeEnabledCheck.Checked {
+			dialog.ShowInformation(appName, "Node is disabled", w)
+			return
+		}
+		dataDir := strings.TrimSpace(nodeDataDirEntry.Text)
+		if dataDir == "" {
+			dataDir = defaultNodeDataDir()
+		}
+		dataDir, err := expandUserPath(dataDir)
+		if err != nil {
+			dialog.ShowError(err, w)
+			return
+		}
+		if dataDir == "" {
+			dialog.ShowError(errors.New("node data directory is required"), w)
+			return
+		}
+
+		doReset := func() {
+			go func(dataDir string) {
+				fyne.Do(func() {
+					setNodeBadge("Node: Resetting", connConnectingColor)
+					setNodeButtons(true)
+				})
+
+				stopNode()
+				deadline := time.Now().Add(90 * time.Second)
+				for {
+					procMu.Lock()
+					running := nodeCmd != nil && nodeCmd.Process != nil
+					procMu.Unlock()
+					if !running {
+						break
+					}
+					if time.Now().After(deadline) {
+						fyne.Do(func() {
+							setNodeBadge("Node: Off", connOfflineColor)
+							setNodeButtons(false)
+							dialog.ShowError(errors.New("node did not stop in time"), w)
+						})
+						return
+					}
+					time.Sleep(250 * time.Millisecond)
+				}
+
+				appendNodeLog("\n[node] Removing local chain data...\n")
+				if err := wipeNodeData(dataDir); err != nil {
+					fyne.Do(func() {
+						setNodeBadge("Node: Off", connOfflineColor)
+						setNodeButtons(false)
+						dialog.ShowError(err, w)
+					})
+					return
+				}
+				nodeChainIssueDialogShown.Store(false)
+
+				if startAfter {
+					requireMiningService := selectedMode() == modeRPCLocal
+					fyne.Do(func() {
+						if err := startNodeAsync(requireMiningService); err != nil {
+							setNodeBadge("Node: Off", connOfflineColor)
+							setNodeButtons(false)
+							dialog.ShowError(err, w)
+						}
+					})
+				} else {
+					fyne.Do(func() {
+						setNodeBadge("Node: Off", connOfflineColor)
+						setNodeButtons(false)
+					})
+				}
+			}(dataDir)
+		}
+
+		if !requireConfirm {
+			doReset()
+			return
+		}
+
+		msg := widget.NewLabel(fmt.Sprintf("This will delete local chain data in %s and resync from scratch.\n\nAccounts (keystore) will be kept.", redactPath(dataDir)))
+		msg.Wrapping = fyne.TextWrapWord
+		d := dialog.NewCustomConfirm(appName, "Reset node data & resync", "Cancel", msg, func(ok bool) {
+			if ok {
+				doReset()
+			}
+		}, w)
+		d.Show()
 	}
 
 	type minerStartOrigin int
@@ -1956,7 +2174,7 @@ func main() {
 		proc := minerCmd.Process
 		_ = proc.Signal(os.Interrupt)
 		go func(cmd *exec.Cmd, p *os.Process) {
-			time.Sleep(5 * time.Second)
+			time.Sleep(10 * time.Second)
 			procMu.Lock()
 			still := minerCmd == cmd
 			procMu.Unlock()
@@ -1972,13 +2190,6 @@ func main() {
 		}
 		if origin == minerStartOriginUser {
 			if err := saveFromUI(); err != nil {
-				return err
-			}
-		}
-
-		if cfg.NodeEnabled {
-			requireMiningService := cfg.Mode == modeRPCLocal
-			if err := startNodeAsync(requireMiningService); err != nil {
 				return err
 			}
 		}
@@ -2000,6 +2211,37 @@ func main() {
 		if err != nil {
 			procMu.Unlock()
 			return err
+		}
+
+		if cfg.Mode == modeRPCLocal {
+			nodeRunning := nodeCmd != nil && nodeCmd.Process != nil
+			runningMode := nodeRunMode
+			if cfg.NodeEnabled {
+				if !nodeRunning {
+					procMu.Unlock()
+					return errors.New("node is enabled but not running; start it in Setup → Node")
+				}
+				if runningMode != nodeModeMine {
+					procMu.Unlock()
+					return errors.New("node is running without mining service enabled; restart the node with mining service enabled")
+				}
+			}
+
+			u, err := url.Parse(poolURL)
+			if err != nil || u.Host == "" {
+				procMu.Unlock()
+				return errors.New("invalid RPC URL")
+			}
+			host := u.Host
+			if !strings.Contains(host, ":") {
+				host += ":80"
+			}
+			conn, err := net.DialTimeout("tcp", host, 750*time.Millisecond)
+			if err != nil {
+				procMu.Unlock()
+				return fmt.Errorf("RPC is not reachable at %s", host)
+			}
+			_ = conn.Close()
 		}
 
 		backendSelection := cfg.Backend
@@ -2089,10 +2331,7 @@ func main() {
 			if s.Difficulty > 0 {
 				jobDifficulty.Store(formatDifficulty(s.Difficulty))
 			}
-			updateLastFoundFromAccept := true
-			if cfg.Mode == modeRPCLocal && cfg.NodeEnabled {
-				updateLastFoundFromAccept = false
-			}
+			updateLastFoundFromAccept := cfg.Mode != modeRPCLocal
 			if hasNewAccept && updateLastFoundFromAccept {
 				if block := currentJobBlock.Load(); block > 0 {
 					lastFoundBlock.Store(block)
@@ -2251,6 +2490,69 @@ func main() {
 	nodeAdvanced := widget.NewAccordion(widget.NewAccordionItem("Advanced", nodeAdvancedBody))
 	nodeAdvanced.CloseAll()
 
+	timeSyncLabel := widget.NewLabelWithStyle("Time sync: Unknown", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
+	timeSyncLabel.Wrapping = fyne.TextWrapOff
+	timeSyncBg := canvas.NewRectangle(theme.Color(theme.ColorNameDisabledButton))
+	timeSyncBg.StrokeColor = theme.Color(theme.ColorNameSeparator)
+	timeSyncBg.StrokeWidth = 1
+	timeSyncBg.CornerRadius = theme.Padding() * 2
+	timeSyncBadge := container.NewMax(
+		timeSyncBg,
+		container.NewPadded(container.NewCenter(timeSyncLabel)),
+	)
+	timeSyncOkColor := theme.Color(theme.ColorNamePrimary)
+	timeSyncBadColor := color.NRGBA{R: 0xF8, G: 0x71, B: 0x71, A: 0xFF}
+	timeSyncUnknownColor := theme.Color(theme.ColorNameDisabledButton)
+	setTimeSyncBadge := func(status timeSyncStatus) {
+		if !status.Known {
+			timeSyncLabel.SetText("Time sync: Unknown")
+			timeSyncBg.FillColor = timeSyncUnknownColor
+			timeSyncBg.Refresh()
+			return
+		}
+		if status.Synchronized {
+			timeSyncLabel.SetText("Time sync: OK")
+			timeSyncBg.FillColor = timeSyncOkColor
+			timeSyncBg.Refresh()
+			return
+		}
+		timeSyncLabel.SetText("Time sync: NOT synchronized")
+		timeSyncBg.FillColor = timeSyncBadColor
+		timeSyncBg.Refresh()
+	}
+	refreshTimeSync := func(showDialog bool) {
+		go func() {
+			status := checkSystemTimeSync()
+			fyne.Do(func() {
+				setTimeSyncBadge(status)
+				if !showDialog {
+					return
+				}
+				if status.Known && !status.Synchronized {
+					help := "Enable time synchronization (NTP) and try again."
+					if runtime.GOOS == "linux" {
+						help = "Linux: enable NTP (timedatectl set-ntp true) and verify:\n\n  timedatectl show -p NTPSynchronized --value\n\nExpected output: yes"
+					} else if runtime.GOOS == "windows" {
+						help = "Windows: enable automatic time sync in Date & time settings and ensure the Windows Time service is running."
+					}
+					msg := widget.NewLabel("System time is not synchronized. This may affect mining and node operation.\n\n" + help)
+					msg.Wrapping = fyne.TextWrapWord
+					dialog.ShowCustom("Time sync warning", "OK", msg, w)
+					return
+				}
+				if !status.Known {
+					msg := widget.NewLabel("Unable to determine system time synchronization status. Please ensure your system time is synchronized (NTP).")
+					msg.Wrapping = fyne.TextWrapWord
+					dialog.ShowCustom("Time sync status", "OK", msg, w)
+				}
+			})
+		}()
+	}
+	timeSyncBtn := widget.NewButtonWithIcon("Check system time sync", theme.ViewRefreshIcon(), func() {
+		refreshTimeSync(true)
+	})
+	timeSyncRow := container.NewHBox(timeSyncBadge, layout.NewSpacer(), timeSyncBtn)
+
 	nodeHint := widget.NewLabel("Tip: For the embedded node, use RPC URL http://127.0.0.1:8545 (or your configured RPC port). For external nodes, disable Run a node and enter your RPC URL.")
 	nodeHint.Wrapping = fyne.TextWrapWord
 	nodeHint.TextStyle = fyne.TextStyle{Italic: true}
@@ -2281,8 +2583,16 @@ func main() {
 	}
 
 	nodeButtonsRow := container.NewHBox(nodeStartBtn, layout.NewSpacer(), nodeStopBtn)
+	nodeResetBtn := widget.NewButtonWithIcon("Reset node data & resync", theme.DeleteIcon(), func() {
+		resetNodeDataAndResync(true, true)
+	})
+	nodeResetBtn.Importance = widget.DangerImportance
+	nodeAdvancedBody.Add(widget.NewSeparator())
+	nodeAdvancedBody.Add(nodeCleanStartCheck)
+	nodeAdvancedBody.Add(nodeResetBtn)
 
 	nodeSettingsBox := container.NewVBox(
+		timeSyncRow,
 		nodeHint,
 		nodeModeRow,
 		nodeEtherbaseRow,
@@ -2422,7 +2732,8 @@ func main() {
 	minerLogsActive.Store(true)
 	nodeLogsActive.Store(false)
 
-	logTab := container.NewPadded(logTabs)
+	logToolbar := container.NewHBox(wrapLogsCheck, layout.NewSpacer())
+	logTab := container.NewPadded(container.NewBorder(logToolbar, nil, nil, nil, logTabs))
 
 	setupItem := container.NewTabItemWithIcon("Setup", theme.SettingsIcon(), setupTab)
 	dashboardItem := container.NewTabItemWithIcon("Dashboard", theme.HomeIcon(), dashboardTab)
@@ -2481,6 +2792,7 @@ func main() {
 	)
 	main := container.NewBorder(container.NewVBox(header, widget.NewSeparator()), nil, nil, nil, tabs)
 	w.SetContent(container.NewMax(bg, main))
+	refreshTimeSync(false)
 
 	if ethminerErr != nil {
 		dialog.ShowError(fmt.Errorf("ethminer not found. Place it next to this app or in PATH: %w", ethminerErr), w)
