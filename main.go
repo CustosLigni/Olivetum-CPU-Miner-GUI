@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"io"
 	"math"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -207,7 +209,7 @@ func main() {
 
 	nodeModeLabels := []string{
 		"Sync only",
-		"Sync + mining service (CPU 1 thread)",
+		"Sync + mining service (starts after sync; CPU disabled)",
 	}
 	nodeModeKeyForLabel := map[string]string{
 		nodeModeLabels[0]: nodeModeSync,
@@ -1777,13 +1779,15 @@ func main() {
 			"--bootnodes", strings.TrimSpace(settings.Bootnodes),
 			"--verbosity", strconv.Itoa(settings.Verbosity),
 		}
+		autoStartMiningServiceAfterSync := false
 		if effectiveMode == nodeModeMine {
 			if !isHexAddress(settings.Wallet) {
 				return errors.New("wallet address is required for node mining")
 			}
+			// Do not start mining immediately: in core-geth this disables snap sync.
+			// We'll enable the mining service after the initial sync completes.
+			autoStartMiningServiceAfterSync = true
 			args = append(args,
-				"--mine",
-				"--miner.threads", "1",
 				"--miner.recommit=1s",
 				"--miner.etherbase", settings.Wallet,
 			)
@@ -1816,6 +1820,10 @@ func main() {
 
 		go streamLines(stdout, appendNodeLog)
 		go streamLines(stderr, appendNodeLog)
+
+		if autoStartMiningServiceAfterSync {
+			go autoStartMiningService(nodeCtx, settings.RPCPort, appendNodeLog)
+		}
 
 		go func(ctx context.Context, port int) {
 			ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -3606,4 +3614,149 @@ func (r *ringLogs) Snapshot() []string {
 		out[i] = r.buf[(r.start+i)%len(r.buf)]
 	}
 	return out
+}
+
+type jsonRPCRequest struct {
+	ID      int    `json:"id"`
+	JSONRPC string `json:"jsonrpc"`
+	Method  string `json:"method"`
+	Params  any    `json:"params,omitempty"`
+}
+
+func rpcCall(ctx context.Context, endpoint, method string, params any) (json.RawMessage, error) {
+	body, err := json.Marshal(jsonRPCRequest{
+		ID:      1,
+		JSONRPC: "2.0",
+		Method:  method,
+		Params:  params,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return nil, fmt.Errorf("rpc http status %d", resp.StatusCode)
+	}
+
+	var decoded apiResp
+	if err := json.Unmarshal(respBody, &decoded); err != nil {
+		return nil, err
+	}
+	if decoded.Error != nil {
+		return nil, fmt.Errorf("rpc error: %v", decoded.Error)
+	}
+	if len(decoded.Result) == 0 {
+		return nil, errors.New("empty rpc result")
+	}
+	return decoded.Result, nil
+}
+
+func rpcHexInt(ctx context.Context, endpoint, method string) (int64, error) {
+	result, err := rpcCall(ctx, endpoint, method, nil)
+	if err != nil {
+		return 0, err
+	}
+	var s string
+	if err := json.Unmarshal(result, &s); err != nil {
+		return 0, err
+	}
+	s = strings.TrimSpace(strings.TrimPrefix(s, "0x"))
+	if s == "" {
+		return 0, nil
+	}
+	v, err := strconv.ParseInt(s, 16, 64)
+	if err != nil {
+		return 0, err
+	}
+	return v, nil
+}
+
+func rpcEthSyncing(ctx context.Context, endpoint string) (bool, error) {
+	result, err := rpcCall(ctx, endpoint, "eth_syncing", nil)
+	if err != nil {
+		return false, err
+	}
+	if bytes.Equal(bytes.TrimSpace(result), []byte("false")) {
+		return false, nil
+	}
+	return true, nil
+}
+
+func rpcMinerStart(ctx context.Context, endpoint string, threads int) error {
+	_, err := rpcCall(ctx, endpoint, "miner_start", []any{threads})
+	return err
+}
+
+func autoStartMiningService(ctx context.Context, rpcPort int, logf func(string)) {
+	endpoint := fmt.Sprintf("http://127.0.0.1:%d", rpcPort)
+	logf("[node] Mining service will start automatically after the initial sync completes.\n")
+
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	readyStreak := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		checkCtx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+		peers, err := rpcHexInt(checkCtx, endpoint, "net_peerCount")
+		cancel()
+		if err != nil || peers <= 0 {
+			readyStreak = 0
+			continue
+		}
+
+		checkCtx, cancel = context.WithTimeout(ctx, 1500*time.Millisecond)
+		blockNum, err := rpcHexInt(checkCtx, endpoint, "eth_blockNumber")
+		cancel()
+		if err != nil || blockNum <= 0 {
+			readyStreak = 0
+			continue
+		}
+
+		checkCtx, cancel = context.WithTimeout(ctx, 1500*time.Millisecond)
+		syncing, err := rpcEthSyncing(checkCtx, endpoint)
+		cancel()
+		if err != nil || syncing {
+			readyStreak = 0
+			continue
+		}
+
+		readyStreak++
+		if readyStreak < 2 {
+			continue
+		}
+
+		startCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		err = rpcMinerStart(startCtx, endpoint, 0) // 0 => CPU mining disabled (external miners only)
+		cancel()
+		if err != nil {
+			readyStreak = 0
+			logf(fmt.Sprintf("[node] Failed to enable mining service: %v\n", err))
+			continue
+		}
+
+		logf("[node] Mining service enabled (CPU mining disabled).\n")
+		return
+	}
 }
