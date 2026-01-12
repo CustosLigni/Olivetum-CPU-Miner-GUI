@@ -919,6 +919,8 @@ func main() {
 		lastFoundBlock            atomic.Int64
 		jobDifficulty             atomic.Value
 		nodeChainIssueDialogShown atomic.Bool
+		nodeChainIssueCount       atomic.Int64
+		nodeChainIssueFirstAt     atomic.Int64
 	)
 	jobDifficulty.Store("")
 
@@ -995,17 +997,36 @@ func main() {
 				}
 			}
 			lower := strings.ToLower(line)
-			isChainIssue := strings.Contains(lower, "bad block") ||
-				strings.Contains(lower, "unknown ancestor") ||
-				(strings.Contains(lower, "failed to read") && strings.Contains(lower, "last block")) ||
+			isLocalDBIssue := (strings.Contains(lower, "failed to read") && strings.Contains(lower, "last block")) ||
 				strings.Contains(lower, "missing trie node") ||
-				strings.Contains(lower, "head state missing") ||
 				(strings.Contains(lower, "failed to restore") && strings.Contains(lower, "runtime")) ||
-				(strings.Contains(lower, "retrieved hash chain is invalid") && strings.Contains(lower, "missing parent"))
-			if isChainIssue {
-				if resetNodeDataAndResync != nil && nodeChainIssueDialogShown.CompareAndSwap(false, true) {
+				(strings.Contains(lower, "database") && strings.Contains(lower, "corrupt")) ||
+				strings.Contains(lower, "chaindata is corrupt") ||
+				strings.Contains(lower, "corruption") ||
+				strings.Contains(lower, "fatal")
+			if isLocalDBIssue && resetNodeDataAndResync != nil {
+				isFatal := (strings.Contains(lower, "failed to read") && strings.Contains(lower, "last block")) ||
+					(strings.Contains(lower, "database") && strings.Contains(lower, "corrupt")) ||
+					strings.Contains(lower, "chaindata is corrupt") ||
+					strings.Contains(lower, "corruption") ||
+					strings.Contains(lower, "fatal")
+
+				now := time.Now().UnixNano()
+				const issueWindow = 45 * time.Second
+				const issueThreshold = int64(3)
+
+				firstAt := nodeChainIssueFirstAt.Load()
+				if firstAt == 0 || now-firstAt > int64(issueWindow) {
+					nodeChainIssueFirstAt.Store(now)
+					nodeChainIssueCount.Store(1)
+				} else {
+					nodeChainIssueCount.Add(1)
+				}
+
+				shouldPrompt := isFatal || nodeChainIssueCount.Load() >= issueThreshold
+				if shouldPrompt && nodeChainIssueDialogShown.CompareAndSwap(false, true) {
 					fyne.Do(func() {
-						msg := widget.NewLabel("Local chain data appears inconsistent or incomplete. A resync is recommended.")
+						msg := widget.NewLabel("A potential local database issue was detected.\n\nIf syncing continues normally, you can ignore this.\nIf the issue repeats after restart or the node cannot sync, a resync may help.")
 						msg.Wrapping = fyne.TextWrapWord
 						d := dialog.NewCustomConfirm(appName, "Reset node data & resync", "Dismiss", msg, func(ok bool) {
 							if ok {
@@ -1980,11 +2001,12 @@ func main() {
 					return
 				}
 				nodeChainIssueDialogShown.Store(false)
+				nodeChainIssueCount.Store(0)
+				nodeChainIssueFirstAt.Store(0)
 
 				if startAfter {
-					requireMiningService := selectedMode() == modeRPCLocal
 					fyne.Do(func() {
-						if err := startNodeAsync(requireMiningService); err != nil {
+						if err := startNodeAsync(false); err != nil {
 							setNodeBadge("Node: Off", connOfflineColor)
 							setNodeButtons(false)
 							dialog.ShowError(err, w)
