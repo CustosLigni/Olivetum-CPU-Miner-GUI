@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"image/color"
 	"io"
-	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -430,6 +429,31 @@ func main() {
 	minerLogBuf := newRingLogs(5000)
 	nodeLogBuf := newRingLogs(5000)
 
+	const (
+		minerIndexSchemeUnknown int32 = iota
+		minerIndexSchemeCompact
+		minerIndexSchemeGlobal
+	)
+	var (
+		minerDeviceMapMu sync.RWMutex
+		minerDeviceMap   []int
+		minerIndexScheme atomic.Int32
+	)
+	minerIndexScheme.Store(minerIndexSchemeUnknown)
+
+	setMinerDeviceMap := func(selected []int) {
+		minerDeviceMapMu.Lock()
+		minerDeviceMap = append([]int(nil), selected...)
+		minerDeviceMapMu.Unlock()
+		minerIndexScheme.Store(minerIndexSchemeUnknown)
+	}
+
+	getMinerDeviceMap := func() []int {
+		minerDeviceMapMu.RLock()
+		defer minerDeviceMapMu.RUnlock()
+		return append([]int(nil), minerDeviceMap...)
+	}
+
 	minerFollowTailCheck := widget.NewCheck("Follow tail", nil)
 	minerFollowTailCheck.SetChecked(true)
 	nodeFollowTailCheck := widget.NewCheck("Follow tail", nil)
@@ -438,18 +462,23 @@ func main() {
 	wrapLogsCheck.SetChecked(true)
 	var wrapLogsEnabled atomic.Bool
 	wrapLogsEnabled.Store(wrapLogsCheck.Checked)
-	logLineHeight := fyne.MeasureText("M", theme.TextSize(), fyne.TextStyle{Monospace: true}).Height
-	baseLogRowHeight := logLineHeight + theme.Padding()*2
-	const maxLogWrapLines = 12
+	var minerFollowTailEnabled atomic.Bool
+	var nodeFollowTailEnabled atomic.Bool
+	minerFollowTailEnabled.Store(minerFollowTailCheck.Checked)
+	nodeFollowTailEnabled.Store(nodeFollowTailCheck.Checked)
 
 	var (
 		logSensorMu sync.RWMutex
 		logSensors  = make(map[int]deviceSensors)
 	)
 	var (
-		logsTabActive   atomic.Bool
-		minerLogsActive atomic.Bool
-		nodeLogsActive  atomic.Bool
+		logsTabActive    atomic.Bool
+		minerLogsActive  atomic.Bool
+		nodeLogsActive   atomic.Bool
+		minerLogVersion  atomic.Int64
+		nodeLogVersion   atomic.Int64
+		minerRenderState atomic.Int64
+		nodeRenderState  atomic.Int64
 	)
 
 	var (
@@ -458,237 +487,113 @@ func main() {
 		nodeLogSnapshotMu  sync.RWMutex
 		nodeLogSnapshot    []string
 	)
-	minerLogLen := func() int {
-		if !minerFollowTailCheck.Checked {
+	minerLogLines := func() []string {
+		if !minerFollowTailEnabled.Load() {
 			minerLogSnapshotMu.RLock()
-			defer minerLogSnapshotMu.RUnlock()
-			if minerLogSnapshot != nil {
-				return len(minerLogSnapshot)
+			snapshot := minerLogSnapshot
+			minerLogSnapshotMu.RUnlock()
+			if len(snapshot) > 0 {
+				return snapshot
 			}
 		}
-		return minerLogBuf.Len()
+		return minerLogBuf.Snapshot()
 	}
-	minerLogAt := func(idx int) string {
-		if !minerFollowTailCheck.Checked {
-			minerLogSnapshotMu.RLock()
-			defer minerLogSnapshotMu.RUnlock()
-			if idx >= 0 && idx < len(minerLogSnapshot) {
-				return minerLogSnapshot[idx]
-			}
-		}
-		return minerLogBuf.At(idx)
-	}
-	nodeLogLen := func() int {
-		if !nodeFollowTailCheck.Checked {
+
+	nodeLogLines := func() []string {
+		if !nodeFollowTailEnabled.Load() {
 			nodeLogSnapshotMu.RLock()
-			defer nodeLogSnapshotMu.RUnlock()
-			if nodeLogSnapshot != nil {
-				return len(nodeLogSnapshot)
+			snapshot := nodeLogSnapshot
+			nodeLogSnapshotMu.RUnlock()
+			if len(snapshot) > 0 {
+				return snapshot
 			}
 		}
-		return nodeLogBuf.Len()
+		return nodeLogBuf.Snapshot()
 	}
-	nodeLogAt := func(idx int) string {
-		if !nodeFollowTailCheck.Checked {
-			nodeLogSnapshotMu.RLock()
-			defer nodeLogSnapshotMu.RUnlock()
-			if idx >= 0 && idx < len(nodeLogSnapshot) {
-				return nodeLogSnapshot[idx]
-			}
+
+	const maxDisplayLogLines = 500
+	minerLogText := widget.NewLabel("")
+	minerLogText.TextStyle = fyne.TextStyle{Monospace: true}
+	minerLogText.Wrapping = fyne.TextWrapBreak
+	nodeLogText := widget.NewLabel("")
+	nodeLogText.TextStyle = fyne.TextStyle{Monospace: true}
+	nodeLogText.Wrapping = fyne.TextWrapBreak
+
+	minerLogScroll := container.NewVScroll(minerLogText)
+	nodeLogScroll := container.NewVScroll(nodeLogText)
+
+	getDisplayLines := func(lines []string) []string {
+		if len(lines) <= maxDisplayLogLines {
+			return lines
 		}
-		return nodeLogBuf.At(idx)
+		return lines[len(lines)-maxDisplayLogLines:]
 	}
 
-	logLineRe := regexp.MustCompile(`^([a-zA-Z])\s+(\d{2}:\d{2}:\d{2})\s+(.*)$`)
-	logInfoColor := color.NRGBA{R: 0x60, G: 0xA5, B: 0xFA, A: 0xFF}
-	logMinerColor := color.NRGBA{R: 0x7C, G: 0xB3, B: 0x42, A: 0xFF}
-	logWarnColor := color.NRGBA{R: 0xFA, G: 0xCC, B: 0x15, A: 0xFF}
-	logErrorColor := color.NRGBA{R: 0xF8, G: 0x71, B: 0x71, A: 0xFF}
-
-	type logRowRefs struct {
-		dot     *canvas.Circle
-		time    *widget.Label
-		message *widget.Label
-		prefix  fyne.CanvasObject
-	}
-	var logRowRefsByContainer sync.Map
-
-	parseLogLine := func(line string) (level, ts, msg string) {
-		line = strings.TrimRight(line, "\r\n")
-		if strings.TrimSpace(line) == "" {
-			return "", "", ""
-		}
-		if m := logLineRe.FindStringSubmatch(line); m != nil {
-			return strings.ToLower(m[1]), m[2], m[3]
-		}
-		return "", "", line
-	}
-
-	logColorForLine := func(level, raw string) color.Color {
-		lower := strings.ToLower(raw)
-		switch {
-		case strings.Contains(lower, "error") || strings.Contains(lower, "fatal") || strings.Contains(lower, "failed"):
-			return logErrorColor
-		case strings.Contains(lower, "warn"):
-			return logWarnColor
-		}
-		switch level {
-		case "e":
-			return logErrorColor
-		case "w":
-			return logWarnColor
-		case "m":
-			return logMinerColor
-		case "i":
-			return logInfoColor
-		default:
-			return theme.Color(theme.ColorNameDisabled)
-		}
-	}
-
-	newLogRow := func() fyne.CanvasObject {
-		dot := canvas.NewCircle(theme.Color(theme.ColorNameDisabled))
-		dotSize := theme.TextSize() * 0.85
-		dotHolder := container.NewVBox(
-			layout.NewSpacer(),
-			container.NewGridWrap(fyne.NewSize(dotSize, dotSize), dot),
-			layout.NewSpacer(),
-		)
-
-		timeLabel := widget.NewLabelWithStyle("", fyne.TextAlignLeading, fyne.TextStyle{Monospace: true})
-		timeLabel.Wrapping = fyne.TextWrapOff
-		timeLabel.Importance = widget.LowImportance
-
-		msg := widget.NewLabel("")
-		msg.Wrapping = fyne.TextWrapOff
-		msg.TextStyle = fyne.TextStyle{Monospace: true}
-
-		prefix := container.NewHBox(dotHolder, timeLabel)
-		row := container.NewBorder(nil, nil, prefix, nil, msg)
-		logRowRefsByContainer.Store(row, &logRowRefs{dot: dot, time: timeLabel, message: msg, prefix: prefix})
-		return row
-	}
-
-	applyLogRow := func(list *widget.List, id widget.ListItemID, item fyne.CanvasObject, line string) {
-		row, ok := item.(*fyne.Container)
-		if !ok {
+	updateLogText := func(lines []string, target *widget.Label) {
+		if len(lines) == 0 {
+			target.SetText("")
 			return
 		}
-		v, ok := logRowRefsByContainer.Load(row)
-		if !ok {
-			return
-		}
-		refs, ok := v.(*logRowRefs)
-		if !ok || refs == nil {
-			return
-		}
-
-		level, ts, msg := parseLogLine(line)
-		refs.dot.FillColor = logColorForLine(level, line)
-		refs.dot.Refresh()
-		if ts != "" {
-			refs.time.SetText(ts + " ")
-		} else {
-			refs.time.SetText("")
-		}
-		wrap := wrapLogsEnabled.Load()
-		if wrap {
-			refs.message.Wrapping = fyne.TextWrapBreak
-		} else {
-			refs.message.Wrapping = fyne.TextWrapOff
-		}
-		refs.message.SetText(msg)
-		refs.message.Refresh()
-
-		if list == nil {
-			return
-		}
-
-		height := baseLogRowHeight
-		if wrap && strings.TrimSpace(msg) != "" {
-			rowWidth := item.Size().Width
-			if rowWidth <= 0 {
-				rowWidth = list.Size().Width
+		var b strings.Builder
+		for i, line := range lines {
+			if i > 0 {
+				b.WriteByte('\n')
 			}
-			availableWidth := rowWidth
-			if refs.prefix != nil {
-				availableWidth -= refs.prefix.MinSize().Width
-			}
-			availableWidth -= theme.Padding() * 2
-			if availableWidth < theme.TextSize()*4 {
-				availableWidth = rowWidth
-			}
-
-			measured := fyne.MeasureText(msg, theme.TextSize(), refs.message.TextStyle)
-			lines := int(math.Ceil(float64(measured.Width) / float64(availableWidth)))
-			if lines < 1 {
-				lines = 1
-			}
-			if lines > maxLogWrapLines {
-				lines = maxLogWrapLines
-			}
-			height = float32(lines)*logLineHeight + theme.Padding()*2
-			if height < baseLogRowHeight {
-				height = baseLogRowHeight
-			}
+			b.WriteString(line)
 		}
-		list.SetItemHeight(id, height)
+		target.SetText(b.String())
 	}
-
-	var minerLogList *widget.List
-	minerLogList = widget.NewList(
-		func() int { return minerLogLen() },
-		func() fyne.CanvasObject {
-			return newLogRow()
-		},
-		func(id widget.ListItemID, item fyne.CanvasObject) {
-			applyLogRow(minerLogList, id, item, minerLogAt(int(id)))
-		},
-	)
-	var nodeLogList *widget.List
-	nodeLogList = widget.NewList(
-		func() int { return nodeLogLen() },
-		func() fyne.CanvasObject {
-			return newLogRow()
-		},
-		func(id widget.ListItemID, item fyne.CanvasObject) {
-			applyLogRow(nodeLogList, id, item, nodeLogAt(int(id)))
-		},
-	)
 
 	wrapLogsCheck.OnChanged = func(enabled bool) {
 		wrapLogsEnabled.Store(enabled)
-		minerLogList.Refresh()
-		nodeLogList.Refresh()
+		if enabled {
+			minerLogText.Wrapping = fyne.TextWrapBreak
+			nodeLogText.Wrapping = fyne.TextWrapBreak
+		} else {
+			minerLogText.Wrapping = fyne.TextWrapOff
+			nodeLogText.Wrapping = fyne.TextWrapOff
+		}
+		minerLogText.Refresh()
+		nodeLogText.Refresh()
 	}
 
 	minerFollowTailCheck.OnChanged = func(enabled bool) {
+		minerFollowTailEnabled.Store(enabled)
 		if enabled {
 			minerLogSnapshotMu.Lock()
 			minerLogSnapshot = nil
 			minerLogSnapshotMu.Unlock()
-			minerLogList.Refresh()
-			minerLogList.ScrollToBottom()
+			minerLogText.Refresh()
+			minerLogScroll.ScrollToBottom()
 			return
 		}
+		snapshot := minerLogBuf.Snapshot()
+		if len(snapshot) == 0 {
+			snapshot = nil
+		}
 		minerLogSnapshotMu.Lock()
-		minerLogSnapshot = minerLogBuf.Snapshot()
+		minerLogSnapshot = snapshot
 		minerLogSnapshotMu.Unlock()
-		minerLogList.Refresh()
+		minerLogText.Refresh()
 	}
 	nodeFollowTailCheck.OnChanged = func(enabled bool) {
+		nodeFollowTailEnabled.Store(enabled)
 		if enabled {
 			nodeLogSnapshotMu.Lock()
 			nodeLogSnapshot = nil
 			nodeLogSnapshotMu.Unlock()
-			nodeLogList.Refresh()
-			nodeLogList.ScrollToBottom()
+			nodeLogText.Refresh()
+			nodeLogScroll.ScrollToBottom()
 			return
 		}
+		snapshot := nodeLogBuf.Snapshot()
+		if len(snapshot) == 0 {
+			snapshot = nil
+		}
 		nodeLogSnapshotMu.Lock()
-		nodeLogSnapshot = nodeLogBuf.Snapshot()
+		nodeLogSnapshot = snapshot
 		nodeLogSnapshotMu.Unlock()
-		nodeLogList.Refresh()
+		nodeLogText.Refresh()
 	}
 
 	type statsHeaderCell struct {
@@ -910,7 +815,6 @@ func main() {
 	}
 
 	type logEvent struct {
-		text  string
 		reset bool
 	}
 
@@ -926,19 +830,28 @@ func main() {
 	)
 	jobDifficulty.Store("")
 
-	minerLogEvents := make(chan logEvent, 4096)
-	nodeLogEvents := make(chan logEvent, 4096)
+	minerLogEvents := make(chan logEvent, 256)
+	nodeLogEvents := make(chan logEvent, 256)
 
 	resetMinerLog := func() {
 		logSensorMu.Lock()
 		logSensors = make(map[int]deviceSensors)
 		logSensorMu.Unlock()
+		minerIndexScheme.Store(minerIndexSchemeUnknown)
+		minerLogSnapshotMu.Lock()
+		minerLogSnapshot = nil
+		minerLogSnapshotMu.Unlock()
+		minerLogBuf.Clear()
 		select {
 		case minerLogEvents <- logEvent{reset: true}:
 		default:
 		}
 	}
 	resetNodeLog := func() {
+		nodeLogSnapshotMu.Lock()
+		nodeLogSnapshot = nil
+		nodeLogSnapshotMu.Unlock()
+		nodeLogBuf.Clear()
 		select {
 		case nodeLogEvents <- logEvent{reset: true}:
 		default:
@@ -949,6 +862,7 @@ func main() {
 
 	appendMinerLog := func(text string) {
 		text = sanitizeLogLine(text)
+		lineCount := 0
 		handleLine := func(line string) {
 			if strings.Contains(line, "cu") || strings.Contains(line, "cl") {
 				if m := gpuStatLine.FindStringSubmatch(line); len(m) == 5 {
@@ -956,8 +870,25 @@ func main() {
 					temp, _ := strconv.Atoi(m[2])
 					fan, _ := strconv.Atoi(m[3])
 					power, _ := strconv.ParseFloat(m[4], 64)
+					mappedIdx := idx
+					if deviceMap := getMinerDeviceMap(); len(deviceMap) > 0 {
+						scheme := minerIndexScheme.Load()
+						if scheme != minerIndexSchemeGlobal && idx >= len(deviceMap) {
+							minerIndexScheme.Store(minerIndexSchemeGlobal)
+							logSensorMu.Lock()
+							logSensors = make(map[int]deviceSensors)
+							logSensorMu.Unlock()
+							scheme = minerIndexSchemeGlobal
+						} else if scheme == minerIndexSchemeUnknown && idx < len(deviceMap) {
+							minerIndexScheme.Store(minerIndexSchemeCompact)
+							scheme = minerIndexSchemeCompact
+						}
+						if scheme == minerIndexSchemeCompact && idx >= 0 && idx < len(deviceMap) {
+							mappedIdx = deviceMap[idx]
+						}
+					}
 					logSensorMu.Lock()
-					logSensors[idx] = deviceSensors{Temp: temp, Fan: fan, Power: power}
+					logSensors[mappedIdx] = deviceSensors{Temp: temp, Fan: fan, Power: power}
 					logSensorMu.Unlock()
 				}
 			}
@@ -967,23 +898,28 @@ func main() {
 				}
 				lastJobAt.Store(time.Now().UnixNano())
 			}
-			select {
-			case minerLogEvents <- logEvent{text: line}:
-			default:
-				// Drop logs if the UI can't keep up.
-			}
+			minerLogBuf.Append(line)
+			lineCount++
 		}
 		if strings.IndexByte(text, '\n') == -1 {
 			handleLine(text)
-			return
+		} else {
+			for _, line := range strings.Split(text, "\n") {
+				handleLine(line)
+			}
 		}
-		for _, line := range strings.Split(text, "\n") {
-			handleLine(line)
+		if lineCount > 0 {
+			minerLogVersion.Add(int64(lineCount))
+			select {
+			case minerLogEvents <- logEvent{}:
+			default:
+			}
 		}
 	}
 
 	appendNodeLog := func(text string) {
 		text = sanitizeLogLine(text)
+		lineCount := 0
 		handleLine := func(line string) {
 			if m := nodeMinedPotentialBlockLine.FindStringSubmatch(line); len(m) == 2 {
 				n := strings.ReplaceAll(m[1], ",", "")
@@ -1041,87 +977,103 @@ func main() {
 					})
 				}
 			}
-			select {
-			case nodeLogEvents <- logEvent{text: line}:
-			default:
-				// Drop logs if the UI can't keep up.
-			}
+			nodeLogBuf.Append(line)
+			lineCount++
 		}
 		if strings.IndexByte(text, '\n') == -1 {
 			handleLine(text)
-			return
+		} else {
+			for _, line := range strings.Split(text, "\n") {
+				handleLine(line)
+			}
 		}
-		for _, line := range strings.Split(text, "\n") {
-			handleLine(line)
+		if lineCount > 0 {
+			nodeLogVersion.Add(int64(lineCount))
+			select {
+			case nodeLogEvents <- logEvent{}:
+			default:
+			}
 		}
 	}
 
 	go func() {
-		ticker := time.NewTicker(500 * time.Millisecond)
+		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
 
 		dirty := false
+		lastVersion := int64(0)
 		for {
 			select {
-			case ev := <-minerLogEvents:
-				if ev.reset {
-					minerLogBuf.Clear()
-					dirty = true
-					continue
-				}
-				minerLogBuf.Append(ev.text)
+			case <-minerLogEvents:
 				dirty = true
 
 			case <-ticker.C:
 				if !dirty || !logsTabActive.Load() || !minerLogsActive.Load() {
 					continue
 				}
+				currentVersion := minerLogVersion.Load()
+				if currentVersion == lastVersion {
+					dirty = false
+					continue
+				}
 				minerLogSnapshotMu.RLock()
-				paused := minerLogSnapshot != nil
+				snapshot := minerLogSnapshot
 				minerLogSnapshotMu.RUnlock()
+				paused := !minerFollowTailEnabled.Load() && len(snapshot) > 0
 				dirty = false
 				if paused {
 					continue
 				}
 				fyne.Do(func() {
-					minerLogList.Refresh()
-					minerLogList.ScrollToBottom()
+					lines := getDisplayLines(minerLogLines())
+					updateLogText(lines, minerLogText)
+					if minerFollowTailEnabled.Load() {
+						minerLogScroll.ScrollToBottom()
+					}
 				})
+				lastVersion = currentVersion
+				minerRenderState.Store(currentVersion)
 			}
 		}
 	}()
 
 	go func() {
-		ticker := time.NewTicker(500 * time.Millisecond)
+		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
 
 		dirty := false
+		lastVersion := int64(0)
 		for {
 			select {
-			case ev := <-nodeLogEvents:
-				if ev.reset {
-					nodeLogBuf.Clear()
-					dirty = true
-					continue
-				}
-				nodeLogBuf.Append(ev.text)
+			case <-nodeLogEvents:
 				dirty = true
 
 			case <-ticker.C:
 				if !dirty || !logsTabActive.Load() || !nodeLogsActive.Load() {
 					continue
 				}
+				currentVersion := nodeLogVersion.Load()
+				if currentVersion == lastVersion {
+					dirty = false
+					continue
+				}
 				nodeLogSnapshotMu.RLock()
-				paused := nodeLogSnapshot != nil
+				snapshot := nodeLogSnapshot
 				nodeLogSnapshotMu.RUnlock()
+				paused := !nodeFollowTailEnabled.Load() && len(snapshot) > 0
 				dirty = false
 				if paused {
 					continue
 				}
 				fyne.Do(func() {
-					nodeLogList.Refresh()
-					nodeLogList.ScrollToBottom()
+					lines := getDisplayLines(nodeLogLines())
+					updateLogText(lines, nodeLogText)
+					if nodeFollowTailEnabled.Load() {
+						nodeLogScroll.ScrollToBottom()
+					}
 				})
+				lastVersion = currentVersion
+				nodeRenderState.Store(currentVersion)
 			}
 		}
 	}()
@@ -2317,6 +2269,8 @@ func main() {
 			}
 		}
 
+		setMinerDeviceMap(cfg.SelectedDevices)
+
 		minerStartedAt.Store(time.Now().UnixNano())
 		lastJobAt.Store(0)
 		currentJobBlock.Store(0)
@@ -2368,6 +2322,64 @@ func main() {
 		go streamLines(stderr, appendMinerLog)
 
 		go pollStats(pollCtx, "127.0.0.1", apiPort, cfg.HWMon, func(s Stat) {
+			if deviceMap := getMinerDeviceMap(); len(deviceMap) > 0 {
+				maxSelected := -1
+				identity := true
+				for i, idx := range deviceMap {
+					if idx > maxSelected {
+						maxSelected = idx
+					}
+					if idx != i {
+						identity = false
+					}
+				}
+				maxLen := len(s.PerGPU_KHs)
+				if len(s.Temps) > maxLen {
+					maxLen = len(s.Temps)
+				}
+				if len(s.Fans) > maxLen {
+					maxLen = len(s.Fans)
+				}
+				if len(s.PerGPU_Power) > maxLen {
+					maxLen = len(s.PerGPU_Power)
+				}
+
+				needRemap := false
+				if maxSelected >= 0 && maxLen > 0 {
+					needRemap = maxLen < maxSelected+1 || (!identity && maxLen <= len(deviceMap))
+				}
+				if needRemap {
+					outLen := maxSelected + 1
+					hashes := make([]int64, outLen)
+					temps := make([]int, outLen)
+					fans := make([]int, outLen)
+					power := make([]float64, outLen)
+					for i := range power {
+						power[i] = -1
+					}
+					for localIdx, deviceIdx := range deviceMap {
+						if deviceIdx < 0 || deviceIdx >= outLen {
+							continue
+						}
+						if localIdx >= 0 && localIdx < len(s.PerGPU_KHs) {
+							hashes[deviceIdx] = s.PerGPU_KHs[localIdx]
+						}
+						if localIdx >= 0 && localIdx < len(s.Temps) {
+							temps[deviceIdx] = s.Temps[localIdx]
+						}
+						if localIdx >= 0 && localIdx < len(s.Fans) {
+							fans[deviceIdx] = s.Fans[localIdx]
+						}
+						if localIdx >= 0 && localIdx < len(s.PerGPU_Power) {
+							power[deviceIdx] = s.PerGPU_Power[localIdx]
+						}
+					}
+					s.PerGPU_KHs = hashes
+					s.Temps = temps
+					s.Fans = fans
+					s.PerGPU_Power = power
+				}
+			}
 			firstStat := waitingForStats.Swap(false)
 			prevAccepted := lastAccepted.Swap(s.Accepted)
 			hasNewAccept := s.Accepted > prevAccepted
@@ -2434,6 +2446,7 @@ func main() {
 			err := cmd.Wait()
 			procMu.Lock()
 			minerCmd = nil
+			setMinerDeviceMap(nil)
 			if pollCancel != nil {
 				pollCancel()
 				pollCancel = nil
@@ -2724,37 +2737,13 @@ func main() {
 	dashboardStack := container.NewVBox(overviewPanel, hashratePanel, statsPanel)
 	dashboardTab := container.NewPadded(container.NewVScroll(dashboardStack))
 
-	minerLogLines := func() []string {
-		if !minerFollowTailCheck.Checked {
-			minerLogSnapshotMu.RLock()
-			if minerLogSnapshot != nil {
-				out := append([]string(nil), minerLogSnapshot...)
-				minerLogSnapshotMu.RUnlock()
-				return out
-			}
-			minerLogSnapshotMu.RUnlock()
-		}
-		return minerLogBuf.Snapshot()
-	}
-	nodeLogLines := func() []string {
-		if !nodeFollowTailCheck.Checked {
-			nodeLogSnapshotMu.RLock()
-			if nodeLogSnapshot != nil {
-				out := append([]string(nil), nodeLogSnapshot...)
-				nodeLogSnapshotMu.RUnlock()
-				return out
-			}
-			nodeLogSnapshotMu.RUnlock()
-		}
-		return nodeLogBuf.Snapshot()
-	}
-
 	minerCopyLogsBtn := widget.NewButtonWithIcon("Copy", theme.ContentCopyIcon(), func() {
 		w.Clipboard().SetContent(strings.Join(minerLogLines(), "\n"))
 	})
 	minerClearLogsBtn := widget.NewButtonWithIcon("Clear", theme.ContentClearIcon(), resetMinerLog)
 	minerLogBar := container.NewHBox(minerFollowTailCheck, layout.NewSpacer(), minerCopyLogsBtn, minerClearLogsBtn)
-	minerLogPanel := panel("Miner Logs", container.NewBorder(minerLogBar, nil, nil, nil, container.NewPadded(minerLogList)))
+
+	minerLogPanel := panel("Miner Logs", container.NewBorder(minerLogBar, nil, nil, nil, container.NewPadded(minerLogScroll)))
 	minerLogTab := container.NewPadded(minerLogPanel)
 
 	nodeCopyLogsBtn := widget.NewButtonWithIcon("Copy", theme.ContentCopyIcon(), func() {
@@ -2762,7 +2751,8 @@ func main() {
 	})
 	nodeClearLogsBtn := widget.NewButtonWithIcon("Clear", theme.ContentClearIcon(), resetNodeLog)
 	nodeLogBar := container.NewHBox(nodeFollowTailCheck, layout.NewSpacer(), nodeCopyLogsBtn, nodeClearLogsBtn)
-	nodeLogPanel := panel("Node Logs", container.NewBorder(nodeLogBar, nil, nil, nil, container.NewPadded(nodeLogList)))
+
+	nodeLogPanel := panel("Node Logs", container.NewBorder(nodeLogBar, nil, nil, nil, container.NewPadded(nodeLogScroll)))
 	nodeLogTab := container.NewPadded(nodeLogPanel)
 
 	minerLogsItem := container.NewTabItemWithIcon("Miner", theme.ComputerIcon(), minerLogTab)
