@@ -131,7 +131,7 @@ func newHashrateChart(maxPoints int) *hashrateChart {
 	tickColor := toNRGBA(theme.Color(theme.ColorNamePlaceHolder))
 	tickColor.A = 0xCC
 
-	c.unitText = canvas.NewText("MH/s", tickColor)
+	c.unitText = canvas.NewText("H/s", tickColor)
 	c.unitText.Alignment = fyne.TextAlignLeading
 	c.unitText.TextStyle = fyne.TextStyle{Bold: true, Monospace: true}
 	c.unitText.TextSize = theme.TextSize() * 0.85
@@ -285,7 +285,7 @@ func (c *hashrateChart) setScale(axisMin, axisMax, axisStep float64) {
 	c.tickMid.Show()
 	c.tickBottom.Show()
 
-	c.unitText.Text = "MH/s"
+	c.unitText.Text = "H/s"
 	c.tickTop.Text = top
 	c.tickMid.Text = mid
 	c.tickBottom.Text = bottom

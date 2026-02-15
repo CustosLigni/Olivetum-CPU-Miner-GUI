@@ -1,5 +1,5 @@
 Param(
-  [string]$EthminerSrc = "",
+  [string]$XmrigSrc = "",
   [string]$GethSrc = "",
   [string]$GenesisSrc = ""
 )
@@ -17,14 +17,14 @@ go mod tidy
 go build -trimpath -ldflags="-H=windowsgui -s -w" -o (Join-Path $Dist "OlivetumMiner.exe") .
 Pop-Location
 
-if ($EthminerSrc -ne "") {
-  if (!(Test-Path $EthminerSrc)) {
-    throw "ethminer binary not found at: $EthminerSrc"
+if ($XmrigSrc -ne "") {
+  if (!(Test-Path $XmrigSrc)) {
+    throw "xmrig binary not found at: $XmrigSrc"
   }
-  Write-Host "[2/3] Copying ethminer..."
-  Copy-Item -Force $EthminerSrc (Join-Path $Dist "ethminer.exe")
+  Write-Host "[2/3] Copying xmrig..."
+  Copy-Item -Force $XmrigSrc (Join-Path $Dist "xmrig.exe")
 } else {
-  Write-Host "[2/3] Skipping ethminer copy (pass -EthminerSrc to bundle it)."
+  Write-Host "[2/3] Skipping xmrig copy (pass -XmrigSrc to bundle it)."
 }
 
 if ($GethSrc -ne "") {
@@ -52,8 +52,8 @@ $ZipPath = Join-Path $Dist "OlivetumMiner-windows-x86_64.zip"
 if (Test-Path $ZipPath) { Remove-Item -Force $ZipPath }
 
 $Files = @((Join-Path $Dist "OlivetumMiner.exe"))
-if (Test-Path (Join-Path $Dist "ethminer.exe")) {
-  $Files += (Join-Path $Dist "ethminer.exe")
+if (Test-Path (Join-Path $Dist "xmrig.exe")) {
+  $Files += (Join-Path $Dist "xmrig.exe")
 }
 if (Test-Path (Join-Path $Dist "geth.exe")) {
   $Files += (Join-Path $Dist "geth.exe")

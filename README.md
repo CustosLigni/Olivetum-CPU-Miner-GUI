@@ -1,21 +1,20 @@
 # Olivetum Miner GUI
 
-A modern GUI wrapper for `ethminer` with Olivetumhash support. Built with Fyne.
+GUI wrapper for `xmrig` (RandomX / `rx/olivetum`) with optional embedded `geth` node.
 
 ## Features
 
-- Quick Start with mining mode selection (Stratum / Solo RPC)
+- CPU mining (XMRig) for Olivetum RandomX
+- Stratum mode and daemon RPC modes (`daemon+http(s)://`)
 - Optional embedded node (geth) with bundled genesis (AppImage)
-- GPU backend selector (Auto / CUDA / OpenCL)
-- Per-device selection and live stats
-- Dashboard with hashrate history and logs
+- CPU thread selection, thread count, huge pages, MSR options
+- Dashboard with hashrate history, per-CPU table, logs
 - AppImage packaging for Linux x86_64
 
 ## Requirements
 
 - Go 1.22+
-- Linux build dependencies for Fyne (OpenGL + X11). See:
-  https://developer.fyne.io/started/
+- Linux build dependencies for Fyne (OpenGL + X11): https://developer.fyne.io/started/
 
 ## Build (binary)
 
@@ -25,14 +24,12 @@ go mod tidy
 go build -trimpath -ldflags="-s -w" -o dist/olivetum-miner-gui .
 ```
 
-`ethminer` must be in the same directory as the GUI binary or available in `PATH`.
-To use the embedded node feature outside AppImage, `geth` must also be available next to the GUI binary or in `PATH`.
+`xmrig` should be next to the GUI binary or available in `PATH`.
+For embedded node support outside AppImage, `geth` should also be next to the GUI binary or in `PATH`.
 
 ## Build (Windows)
 
-Fyne uses GLFW (cgo), so you need a working C toolchain on Windows (MSYS2/MinGW or Visual Studio Build Tools).
-See the Fyne docs for platform-specific dependencies:
-https://developer.fyne.io/started/
+Fyne uses GLFW (cgo), so a working C toolchain is required (MSYS2/MinGW or Visual Studio Build Tools).
 
 ```powershell
 mkdir dist
@@ -40,39 +37,26 @@ go mod tidy
 go build -trimpath -ldflags="-H=windowsgui -s -w" -o dist\\OlivetumMiner.exe .
 ```
 
-Place `ethminer.exe` next to `OlivetumMiner.exe` (or make sure it is in `PATH`).
-To use the embedded node feature, also place `geth.exe` next to `OlivetumMiner.exe` (or make sure it is in `PATH`).
-
-## Windows quick start (prebuilt)
-
-1. Download `OlivetumMiner-windows-x86_64.zip` from this repo (GitHub Actions artifact).
-2. Download `olivetum-ethminer-win64.zip` from the Olivetum ethminer fork repository (GitHub Actions artifact).
-3. Extract both ZIPs into the same folder so you have:
-   - `OlivetumMiner.exe`
-   - `ethminer.exe`
-4. Run `OlivetumMiner.exe`, select `GPU backend` (Auto / CUDA / OpenCL), then click `Start mining`.
-
-## Getting `ethminer`
-
-This project is a GUI wrapper, it does not build `ethminer` from source.
-
-- Build `ethminer` from the Olivetum fork/repo, then point the GUI to it (same directory or `PATH`).
-- For AppImage packaging, provide the built `ethminer` path via `ETHMINER_SRC` (see below).
+Place `xmrig.exe` next to `OlivetumMiner.exe` (or in `PATH`).
+For embedded node support, place `geth.exe` next to `OlivetumMiner.exe` (or in `PATH`).
 
 ## Build (AppImage)
 
-The AppImage bundles the GUI, `ethminer`, `geth` and the Olivetum genesis.
+The AppImage bundles the GUI, `xmrig`, `geth` and the Olivetum genesis.
 
 ```bash
-export ETHMINER_SRC=/path/to/ethminer
+export XMRIG_SRC=/path/to/xmrig
 export GETH_SRC=/path/to/geth
 ./build-appimage.sh
 ```
 
-The script downloads `appimagetool` if missing and produces:
-`dist/OlivetumMiner-x86_64.AppImage`
+Output:
 
-If `ETHMINER_SRC`/`GETH_SRC` are not provided, the script attempts to auto-detect them from sibling repos (recommended for the monorepo layout).
+```text
+dist/OlivetumMiner-x86_64.AppImage
+```
+
+If `XMRIG_SRC`/`GETH_SRC` are not set, the script attempts auto-detection from sibling repos.
 
 ## Run (AppImage)
 
@@ -81,27 +65,23 @@ chmod +x OlivetumMiner-x86_64.AppImage
 ./OlivetumMiner-x86_64.AppImage
 ```
 
-On some distros you may need FUSE (`libfuse2`/`fuse`) to run AppImages.
+On some distros you may need FUSE (`libfuse2`/`fuse`) for AppImages.
 
 ## Configuration
 
-User settings are stored locally in:
+User settings are stored in:
 
-```
+```text
 ~/.config/olivetum-miner-gui/config.json
 ```
 
-This file is not part of the repository and is created on first run.
-
 ## Embedded node (geth)
 
-In `Setup` you can enable `Run a node` and start/stop the node from the GUI.
+In `Setup` you can enable `Run a node` and start/stop the node from GUI.
 
-For local solo mining using the embedded node:
+For local daemon mining:
 
-1. Select `Mode` → `Solo (Local RPC)`
+1. Select `Mode` -> `Solo (Local RPC)`
 2. Enable `Run a node`
-3. Set your `Wallet` (used as `--miner.etherbase`)
-4. Click `Start mining`
-
-If the node is already running in sync-only mode, the GUI will ask you to restart it with the mining service enabled.
+3. Set node mining address in Node settings (if needed)
+4. Start node, then start mining

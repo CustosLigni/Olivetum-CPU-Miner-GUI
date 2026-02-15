@@ -5,15 +5,28 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DIST_DIR="${ROOT_DIR}/dist"
 APPDIR="${DIST_DIR}/OlivetumMiner.AppDir"
 
-ETHMINER_SRC="${ETHMINER_SRC:-}"
-if [[ -z "${ETHMINER_SRC}" ]]; then
+export LC_ALL=C
+export TZ=UTC
+
+if [[ -z "${SOURCE_DATE_EPOCH:-}" ]]; then
+  if command -v git >/dev/null 2>&1 && git -C "${ROOT_DIR}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    SOURCE_DATE_EPOCH="$(git -C "${ROOT_DIR}" show -s --format=%ct HEAD 2>/dev/null || true)"
+  fi
+  if [[ -z "${SOURCE_DATE_EPOCH:-}" ]]; then
+    SOURCE_DATE_EPOCH="$(date -u +%s)"
+  fi
+fi
+
+APPIMAGETOOL_SHA256="b90f4a8b18967545fda78a445b27680a1642f1ef9488ced28b65398f2be7add2"
+
+XMRIG_SRC="${XMRIG_SRC:-}"
+if [[ -z "${XMRIG_SRC}" ]]; then
   for candidate in \
-    "${ROOT_DIR}/../Olivetum-GPU-Miner/build_gcc12/ethminer/ethminer" \
-    "${ROOT_DIR}/../Olivetum-GPU-Miner/build/ethminer/ethminer" \
-    "${ROOT_DIR}/../Olivetum-GPU-Miner-main/build/ethminer/ethminer" \
-    "${ROOT_DIR}/ethminer"; do
+    "${ROOT_DIR}/../xmrig-olivetum/build/xmrig" \
+    "${ROOT_DIR}/../xmrig-olivetum/bin/xmrig" \
+    "${ROOT_DIR}/xmrig"; do
     if [[ -x "${candidate}" ]]; then
-      ETHMINER_SRC="${candidate}"
+      XMRIG_SRC="${candidate}"
       break
     fi
   done
@@ -35,9 +48,9 @@ GENESIS_SRC="${GENESIS_SRC:-${ROOT_DIR}/assets/olivetum_pow_genesis.json}"
 
 mkdir -p "${DIST_DIR}"
 
-if [[ ! -x "${ETHMINER_SRC}" ]]; then
-  echo "ERROR: ethminer binary not found at: ${ETHMINER_SRC}" >&2
-  echo "Build it first in Olivetum-GPU-Miner (or adjust ETHMINER_SRC)." >&2
+if [[ ! -x "${XMRIG_SRC}" ]]; then
+  echo "ERROR: xmrig binary not found at: ${XMRIG_SRC}" >&2
+  echo "Build it first in xmrig-olivetum (or adjust XMRIG_SRC)." >&2
   exit 1
 fi
 
@@ -52,13 +65,13 @@ if [[ ! -f "${GENESIS_SRC}" ]]; then
   exit 1
 fi
 
-echo "Using ethminer: ${ETHMINER_SRC}"
+echo "Using xmrig: ${XMRIG_SRC}"
 echo "Using geth: ${GETH_SRC}"
 
 echo "[1/4] Building GUI..."
 cd "${ROOT_DIR}"
-go mod tidy
-go build -trimpath -ldflags="-s -w" -o "${DIST_DIR}/olivetum-miner-gui" ./...
+go mod download
+go build -trimpath -buildvcs=false -ldflags="-s -w -buildid=" -o "${DIST_DIR}/olivetum-miner-gui" ./...
 
 echo "[2/4] Building AppDir..."
 rm -rf "${APPDIR}"
@@ -68,16 +81,16 @@ mkdir -p "${APPDIR}/usr/bin" \
   "${APPDIR}/usr/share/icons/hicolor/scalable/apps"
 
 cp -f "${DIST_DIR}/olivetum-miner-gui" "${APPDIR}/usr/bin/olivetum-miner-gui"
-cp -f "${ETHMINER_SRC}" "${APPDIR}/usr/bin/ethminer"
+cp -f "${XMRIG_SRC}" "${APPDIR}/usr/bin/xmrig"
 cp -f "${GETH_SRC}" "${APPDIR}/usr/bin/geth"
 cp -f "${GENESIS_SRC}" "${APPDIR}/usr/share/olivetum/olivetum_pow_genesis.json"
-chmod +x "${APPDIR}/usr/bin/olivetum-miner-gui" "${APPDIR}/usr/bin/ethminer" "${APPDIR}/usr/bin/geth"
+chmod +x "${APPDIR}/usr/bin/olivetum-miner-gui" "${APPDIR}/usr/bin/xmrig" "${APPDIR}/usr/bin/geth"
 
 cat > "${APPDIR}/usr/share/applications/olivetum-miner-gui.desktop" <<'EOF'
 [Desktop Entry]
 Type=Application
 Name=Olivetum Miner
-Comment=Simple GUI wrapper for ethminer (Olivetumhash)
+Comment=Simple GUI wrapper for XMRig RandomX (Olivetum)
 Exec=olivetum-miner-gui
 Icon=olivetum-miner-gui
 Terminal=false
@@ -110,15 +123,51 @@ chmod +x "${APPDIR}/AppRun"
 cp -f "${APPDIR}/usr/share/applications/olivetum-miner-gui.desktop" "${APPDIR}/olivetum-miner-gui.desktop"
 cp -f "${APPDIR}/usr/share/icons/hicolor/scalable/apps/olivetum-miner-gui.svg" "${APPDIR}/olivetum-miner-gui.svg"
 
+if command -v touch >/dev/null 2>&1; then
+  if ! find "${APPDIR}" -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} + >/dev/null 2>&1; then
+    find "${APPDIR}" -exec touch -d "@${SOURCE_DATE_EPOCH}" {} +
+  fi
+fi
+
 echo "[3/4] Fetching appimagetool..."
 APPIMAGETOOL="${DIST_DIR}/appimagetool-x86_64.AppImage"
 if [[ ! -x "${APPIMAGETOOL}" ]]; then
   curl -L -o "${APPIMAGETOOL}" "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage"
   chmod +x "${APPIMAGETOOL}"
 fi
+if command -v sha256sum >/dev/null 2>&1; then
+  actual="$(sha256sum "${APPIMAGETOOL}" | awk '{print $1}')"
+  if [[ "${actual}" != "${APPIMAGETOOL_SHA256}" ]]; then
+    echo "ERROR: appimagetool SHA256 mismatch: ${actual}" >&2
+    echo "Expected: ${APPIMAGETOOL_SHA256}" >&2
+    exit 1
+  fi
+fi
 
 echo "[4/4] Creating AppImage..."
 OUT="${DIST_DIR}/OlivetumMiner-x86_64.AppImage"
-"${APPIMAGETOOL}" "${APPDIR}" "${OUT}"
+OUT_TMP="${OUT}.tmp.$$"
+MKSQUASHFS_BIN="$(command -v mksquashfs || true)"
+if [[ -z "${MKSQUASHFS_BIN}" ]]; then
+  echo "ERROR: mksquashfs not found. Install squashfs-tools." >&2
+  exit 1
+fi
+
+TOOL_TMP="$(mktemp -d)"
+cleanup() {
+  rm -rf "${TOOL_TMP}" || true
+}
+trap cleanup EXIT
+
+(cd "${TOOL_TMP}" && "${APPIMAGETOOL}" --appimage-extract >/dev/null)
+rm -f "${TOOL_TMP}/squashfs-root/usr/lib/appimagekit/mksquashfs"
+ln -s "${MKSQUASHFS_BIN}" "${TOOL_TMP}/squashfs-root/usr/lib/appimagekit/mksquashfs"
+
+env -u SOURCE_DATE_EPOCH "${TOOL_TMP}/squashfs-root/AppRun" \
+  --mksquashfs-opt "-processors" --mksquashfs-opt "1" \
+  --mksquashfs-opt "-mkfs-time" --mksquashfs-opt "${SOURCE_DATE_EPOCH}" \
+  --mksquashfs-opt "-all-time" --mksquashfs-opt "${SOURCE_DATE_EPOCH}" \
+  "${APPDIR}" "${OUT_TMP}"
+mv -f "${OUT_TMP}" "${OUT}"
 
 echo "Done: ${OUT}"

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"image/color"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -53,25 +54,29 @@ const (
 	modeRPCLocal   = "rpc-local"
 	modeRPCGateway = "rpc-gateway"
 
-	backendAuto   = "auto"
-	backendCUDA   = "cuda"
-	backendOpenCL = "opencl"
-
 	nodeModeSync = "sync"
 	nodeModeMine = "mine"
 )
 
 type Config struct {
-	Mode            string `json:"mode"`
+	Mode          string `json:"mode"`
+	StratumHost   string `json:"stratumHost"`
+	StratumPort   int    `json:"stratumPort"`
+	RPCURL        string `json:"rpcUrl"`
+	WalletAddress string `json:"walletAddress"`
+	WorkerName    string `json:"workerName"`
+
+	CPUThreads      int   `json:"cpuThreads"`
+	CPUAffinity     []int `json:"cpuAffinity"`
+	UseHugePages    bool  `json:"useHugePages"`
+	EnableMSR       bool  `json:"enableMsr"`
+	AutoGrantMSR    bool  `json:"autoGrantMsr"`
+	DonateLevel     int   `json:"donateLevel"`
+	DisplayInterval int   `json:"displayInterval"`
+
 	Backend         string `json:"backend"`
-	StratumHost     string `json:"stratumHost"`
-	StratumPort     int    `json:"stratumPort"`
-	RPCURL          string `json:"rpcUrl"`
-	WalletAddress   string `json:"walletAddress"`
-	WorkerName      string `json:"workerName"`
 	SelectedDevices []int  `json:"selectedDevices"`
 	ReportHashrate  bool   `json:"reportHashrate"`
-	DisplayInterval int    `json:"displayInterval"`
 	HWMon           bool   `json:"hwMon"`
 
 	NodeEnabled    bool   `json:"nodeEnabled"`
@@ -97,19 +102,21 @@ type Device struct {
 }
 
 type Stat struct {
-	Version      string
-	UptimeMin    int
-	TotalKHs     int64
-	Accepted     int64
-	Rejected     int64
-	Invalid      int64
-	PoolSwitches int64
-	PerGPU_KHs   []int64
-	PerGPU_Power []float64
-	Temps        []int
-	Fans         []int
-	Pool         string
-	Difficulty   float64
+	Version       string
+	UptimeMin     int
+	TotalKHs      int64
+	TotalHashrate float64
+	ActiveThreads int
+	Accepted      int64
+	Rejected      int64
+	Invalid       int64
+	PoolSwitches  int64
+	PerGPU_KHs    []int64
+	PerGPU_Power  []float64
+	Temps         []int
+	Fans          []int
+	Pool          string
+	Difficulty    float64
 }
 
 func main() {
@@ -122,7 +129,7 @@ func main() {
 
 	cfg := loadConfig()
 
-	ethminerPath, ethminerErr := findEthminer()
+	xmrigPath, xmrigErr := findXMRig()
 
 	modeLabels := []string{
 		"Solo Pool (Stratum)",
@@ -154,33 +161,25 @@ func main() {
 		return modeStratum
 	}
 
-	backendLabels := []string{
-		"Auto (recommended)",
-		"CUDA (NVIDIA)",
-		"OpenCL (AMD/NVIDIA)",
+	threadsEntry := widget.NewEntry()
+	if cfg.CPUThreads > 0 {
+		threadsEntry.SetText(strconv.Itoa(cfg.CPUThreads))
 	}
-	backendKeyForLabel := map[string]string{
-		backendLabels[0]: backendAuto,
-		backendLabels[1]: backendCUDA,
-		backendLabels[2]: backendOpenCL,
-	}
-	backendLabelForKey := map[string]string{
-		backendAuto:   backendLabels[0],
-		backendCUDA:   backendLabels[1],
-		backendOpenCL: backendLabels[2],
-	}
-	backendSelect := widget.NewSelect(backendLabels, nil)
-	if initial, ok := backendLabelForKey[cfg.Backend]; ok && initial != "" {
-		backendSelect.SetSelected(initial)
-	} else {
-		backendSelect.SetSelected(backendLabels[0])
-	}
+	threadsEntry.SetPlaceHolder(fmt.Sprintf("Auto (%d)", runtime.NumCPU()))
 
-	selectedBackend := func() string {
-		if v, ok := backendKeyForLabel[strings.TrimSpace(backendSelect.Selected)]; ok {
-			return v
-		}
-		return backendAuto
+	msrCheck := widget.NewCheck("Enable MSR boost (RandomX WRMSR)", nil)
+	msrCheck.SetChecked(cfg.EnableMSR)
+
+	autoMSRCheck := widget.NewCheck("Auto grant MSR permissions with pkexec/setcap (Linux)", nil)
+	autoMSRCheck.SetChecked(cfg.AutoGrantMSR)
+
+	hugePagesCheck := widget.NewCheck("Use huge pages", nil)
+	hugePagesCheck.SetChecked(cfg.UseHugePages)
+
+	donateEntry := widget.NewEntry()
+	donateEntry.SetPlaceHolder("0")
+	if cfg.DonateLevel >= 0 {
+		donateEntry.SetText(strconv.Itoa(cfg.DonateLevel))
 	}
 
 	hostEntry := widget.NewEntry()
@@ -281,15 +280,11 @@ func main() {
 	watchdogRetryWindowEntry.SetText(strconv.Itoa(cfg.WatchdogRetryWindowMin))
 	watchdogRetryWindowEntry.SetPlaceHolder("10")
 
-	reportHashrateCheck := widget.NewCheck("Report hashrate to pool (-R)", nil)
-	reportHashrateCheck.SetChecked(cfg.ReportHashrate)
-
 	displayIntervalEntry := widget.NewEntry()
-	displayIntervalEntry.SetText(strconv.Itoa(cfg.DisplayInterval))
+	if cfg.DisplayInterval > 0 {
+		displayIntervalEntry.SetText(strconv.Itoa(cfg.DisplayInterval))
+	}
 	displayIntervalEntry.SetPlaceHolder("10")
-
-	hwmonCheck := widget.NewCheck("Enable hardware monitoring (temps/fans/power)", nil)
-	hwmonCheck.SetChecked(cfg.HWMon)
 
 	statusDot := canvas.NewCircle(theme.Color(theme.ColorNameDisabled))
 	statusDot.Resize(fyne.NewSize(10, 10))
@@ -354,7 +349,7 @@ func main() {
 	poolValue := widget.NewLabel("—")
 	poolValue.Wrapping = fyne.TextWrapWord
 	uptimeValue := widget.NewLabel("—")
-	backendInUseValue := widget.NewLabel("—")
+	threadsInUseValue := widget.NewLabel("—")
 
 	currentBlockValue := widget.NewLabelWithStyle("—", fyne.TextAlignLeading, fyne.TextStyle{Monospace: true})
 	currentDifficultyValue := widget.NewLabelWithStyle("—", fyne.TextAlignLeading, fyne.TextStyle{Monospace: true})
@@ -406,18 +401,18 @@ func main() {
 	modeHint.Wrapping = fyne.TextWrapWord
 	modeHint.TextStyle = fyne.TextStyle{Italic: true}
 
-	backendHint := widget.NewLabel("Tip: Auto uses CUDA on NVIDIA and OpenCL on AMD/Intel.")
-	backendHint.Wrapping = fyne.TextWrapWord
-	backendHint.TextStyle = fyne.TextStyle{Italic: true}
+	cpuHint := widget.NewLabel("Tip: Select logical CPU threads. If none are selected, XMRig uses the thread count field.")
+	cpuHint.Wrapping = fyne.TextWrapWord
+	cpuHint.TextStyle = fyne.TextStyle{Italic: true}
 
-	backendResolvedHint := widget.NewLabel("")
-	backendResolvedHint.Wrapping = fyne.TextWrapWord
-	backendResolvedHint.TextStyle = fyne.TextStyle{Italic: true}
+	cpuResolvedHint := widget.NewLabel("")
+	cpuResolvedHint.Wrapping = fyne.TextWrapWord
+	cpuResolvedHint.TextStyle = fyne.TextStyle{Italic: true}
 
 	devicesBox := container.NewVBox()
 	devicesActivity := widget.NewActivity()
 	devicesActivity.Hide()
-	devicesLoadingLabel := widget.NewLabel("Detecting GPUs...")
+	devicesLoadingLabel := widget.NewLabel("Detecting CPU threads...")
 	devicesLoadingRow := container.NewHBox(devicesActivity, devicesLoadingLabel)
 	var (
 		devMu        sync.Mutex
@@ -429,23 +424,15 @@ func main() {
 	minerLogBuf := newRingLogs(5000)
 	nodeLogBuf := newRingLogs(5000)
 
-	const (
-		minerIndexSchemeUnknown int32 = iota
-		minerIndexSchemeCompact
-		minerIndexSchemeGlobal
-	)
 	var (
 		minerDeviceMapMu sync.RWMutex
 		minerDeviceMap   []int
-		minerIndexScheme atomic.Int32
 	)
-	minerIndexScheme.Store(minerIndexSchemeUnknown)
 
 	setMinerDeviceMap := func(selected []int) {
 		minerDeviceMapMu.Lock()
 		minerDeviceMap = append([]int(nil), selected...)
 		minerDeviceMapMu.Unlock()
-		minerIndexScheme.Store(minerIndexSchemeUnknown)
 	}
 
 	getMinerDeviceMap := func() []int {
@@ -601,14 +588,14 @@ func main() {
 		Icon  fyne.Resource
 	}
 	statsHeader := []statsHeaderCell{
-		{Label: "GPU"},
+		{Label: "CPU"},
 		{Label: "Name"},
 		{Label: "Hashrate", Icon: iconHash},
 		{Label: "Temp", Icon: iconThermometer},
 		{Label: "Fan", Icon: iconFan},
 		{Label: "Power", Icon: iconBolt},
 	}
-	statsColWidths := []float32{60, 260, 130, 90, 90, 100}
+	statsColWidths := []float32{72, 360, 150, 100, 90, 100}
 	statsHeaderHeight := theme.TextSize() * 1.8
 	statsHeaderRow := func() fyne.CanvasObject {
 		iconSize := theme.TextSize() * 1.1
@@ -676,7 +663,7 @@ func main() {
 				text.Alignment = fyne.TextAlignTrailing
 				text.TextStyle = fyne.TextStyle{Monospace: true}
 				if data.Hashrate > 0 {
-					text.SetText(fmt.Sprintf("%.2f MH/s", data.Hashrate))
+					text.SetText(formatHashrate(data.Hashrate))
 				} else {
 					text.SetText("—")
 				}
@@ -757,11 +744,11 @@ func main() {
 		for i := 0; i < maxCount; i++ {
 			name := labelMap[i]
 			if name == "" {
-				name = fmt.Sprintf("GPU %d", i)
+				name = fmt.Sprintf("CPU %d", i)
 			}
 			hashrate := -1.0
 			if i < len(s.PerGPU_KHs) {
-				hashrate = float64(s.PerGPU_KHs[i]) / 1000.0
+				hashrate = float64(s.PerGPU_KHs[i])
 			}
 			temp := 0
 			if i < len(s.Temps) && s.Temps[i] > 0 {
@@ -837,7 +824,6 @@ func main() {
 		logSensorMu.Lock()
 		logSensors = make(map[int]deviceSensors)
 		logSensorMu.Unlock()
-		minerIndexScheme.Store(minerIndexSchemeUnknown)
 		minerLogSnapshotMu.Lock()
 		minerLogSnapshot = nil
 		minerLogSnapshotMu.Unlock()
@@ -864,36 +850,11 @@ func main() {
 		text = sanitizeLogLine(text)
 		lineCount := 0
 		handleLine := func(line string) {
-			if strings.Contains(line, "cu") || strings.Contains(line, "cl") {
-				if m := gpuStatLine.FindStringSubmatch(line); len(m) == 5 {
-					idx, _ := strconv.Atoi(m[1])
-					temp, _ := strconv.Atoi(m[2])
-					fan, _ := strconv.Atoi(m[3])
-					power, _ := strconv.ParseFloat(m[4], 64)
-					mappedIdx := idx
-					if deviceMap := getMinerDeviceMap(); len(deviceMap) > 0 {
-						scheme := minerIndexScheme.Load()
-						if scheme != minerIndexSchemeGlobal && idx >= len(deviceMap) {
-							minerIndexScheme.Store(minerIndexSchemeGlobal)
-							logSensorMu.Lock()
-							logSensors = make(map[int]deviceSensors)
-							logSensorMu.Unlock()
-							scheme = minerIndexSchemeGlobal
-						} else if scheme == minerIndexSchemeUnknown && idx < len(deviceMap) {
-							minerIndexScheme.Store(minerIndexSchemeCompact)
-							scheme = minerIndexSchemeCompact
-						}
-						if scheme == minerIndexSchemeCompact && idx >= 0 && idx < len(deviceMap) {
-							mappedIdx = deviceMap[idx]
-						}
-					}
-					logSensorMu.Lock()
-					logSensors[mappedIdx] = deviceSensors{Temp: temp, Fan: fan, Power: power}
-					logSensorMu.Unlock()
+			if m := xmrigJobLine.FindStringSubmatch(line); len(m) == 3 {
+				if diff := strings.TrimSpace(m[1]); diff != "" {
+					jobDifficulty.Store(diff)
 				}
-			}
-			if m := jobBlockLine.FindStringSubmatch(line); len(m) == 2 {
-				if block, err := strconv.ParseInt(m[1], 10, 64); err == nil && block > 0 {
+				if block, err := strconv.ParseInt(m[2], 10, 64); err == nil && block > 0 {
 					currentJobBlock.Store(block)
 				}
 				lastJobAt.Store(time.Now().UnixNano())
@@ -1078,7 +1039,7 @@ func main() {
 		}
 	}()
 
-	refreshBtn := widget.NewButtonWithIcon("Refresh GPUs", theme.ViewRefreshIcon(), nil)
+	refreshBtn := widget.NewButtonWithIcon("Refresh CPUs", theme.ViewRefreshIcon(), nil)
 
 	quickPoolRow := container.NewGridWithColumns(2, hostEntry, portEntry)
 	modeRow := formRow("Mode", modeSelect)
@@ -1096,24 +1057,21 @@ func main() {
 			walletRow.Show()
 			rpcRow.Hide()
 			rpcEntry.Enable()
-			reportHashrateCheck.Enable()
-			modeHint.SetText("Solo Pool (Stratum): solo mining; no node required; reward goes to the wallet above.")
+			modeHint.SetText("Solo Pool (Stratum): rewards go to the wallet above.")
 		case modeRPCLocal:
 			poolRow.Hide()
 			workerRow.Hide()
 			walletRow.Hide()
 			rpcRow.Show()
 			rpcEntry.Enable()
-			reportHashrateCheck.Disable()
-			modeHint.SetText("RPC local: mines to node coinbase; wallet/worker ignored. If you enable Run a node, set the mining address in Node settings.")
+			modeHint.SetText("Local daemon RPC: mines against a local Olivetum node; wallet/worker ignored.")
 		case modeRPCGateway:
 			poolRow.Hide()
 			workerRow.Hide()
 			walletRow.Show()
 			rpcRow.Show()
 			rpcEntry.Enable()
-			reportHashrateCheck.Disable()
-			modeHint.SetText("RPC gateway: node must support olivetumhash_getWorkFor; reward goes to wallet above.")
+			modeHint.SetText("RPC gateway: mines against remote Olivetum RPC; reward goes to wallet above.")
 		default:
 			modeHint.SetText("")
 		}
@@ -1124,10 +1082,6 @@ func main() {
 	applyModeUI()
 
 	refreshDevices := func() {
-		if ethminerErr != nil {
-			dialog.ShowError(fmt.Errorf("ethminer not found: %w", ethminerErr), w)
-			return
-		}
 		refreshBtn.Disable()
 		devicesActivity.Show()
 		devicesActivity.Start()
@@ -1135,21 +1089,15 @@ func main() {
 		devicesBox.Refresh()
 
 		go func() {
-			backendSelection := selectedBackend()
-			backend := resolveBackend(ethminerPath, backendSelection)
-			list, out, err := listEthminerDevices(ethminerPath, backend)
+			list, err := listCPUDevices()
 			if err != nil {
 				appendMinerLog(fmt.Sprintf("[devices] %v\n", err))
 				fyne.Do(func() {
 					devicesActivity.Stop()
 					devicesActivity.Hide()
-					if backendSelection == backendAuto {
-						backendResolvedHint.SetText(fmt.Sprintf("Auto resolved to: %s", strings.ToUpper(backend)))
-					} else {
-						backendResolvedHint.SetText("")
-					}
+					cpuResolvedHint.SetText("")
 					devicesBox.Objects = []fyne.CanvasObject{
-						widget.NewLabel("Failed to detect GPUs. See Logs for details."),
+						widget.NewLabel("Failed to detect CPU topology. See Logs for details."),
 					}
 					devicesBox.Refresh()
 					refreshBtn.Enable()
@@ -1157,8 +1105,8 @@ func main() {
 				return
 			}
 
-			selected := make(map[int]bool, len(cfg.SelectedDevices))
-			for _, idx := range cfg.SelectedDevices {
+			selected := make(map[int]bool, len(cfg.CPUAffinity))
+			for _, idx := range cfg.CPUAffinity {
 				selected[idx] = true
 			}
 			var (
@@ -1166,22 +1114,19 @@ func main() {
 				newChecks  []*widget.Check
 			)
 			if len(list) == 0 {
-				backendName := "OpenCL"
-				if backend == backendCUDA {
-					backendName = "CUDA"
-				}
-				if strings.TrimSpace(out) != "" {
-					appendMinerLog(fmt.Sprintf("[devices] %s --list-devices output:\n%s\n", backendName, strings.TrimSpace(out)))
-				}
 				newObjects = []fyne.CanvasObject{
-					widget.NewLabel(fmt.Sprintf("No %s devices found. If you use NVIDIA, pick CUDA. For AMD/Intel, install drivers with OpenCL support.", backendName)),
+					widget.NewLabel("No logical CPU threads detected."),
 				}
 			} else {
 				newObjects = make([]fyne.CanvasObject, 0, len(list))
 				newChecks = make([]*widget.Check, 0, len(list))
 				for _, d := range list {
 					d := d
-					check := widget.NewCheck(fmt.Sprintf("[%d] %s (%s)", d.Index, d.Name, d.PCI), nil)
+					label := fmt.Sprintf("[%d] %s", d.Index, d.Name)
+					if strings.TrimSpace(d.PCI) != "" {
+						label = fmt.Sprintf("[%d] %s (%s)", d.Index, d.Name, d.PCI)
+					}
+					check := widget.NewCheck(label, nil)
 					check.SetChecked(selected[d.Index])
 					newChecks = append(newChecks, check)
 					newObjects = append(newObjects, check)
@@ -1204,11 +1149,7 @@ func main() {
 			fyne.Do(func() {
 				devicesActivity.Stop()
 				devicesActivity.Hide()
-				if backendSelection == backendAuto {
-					backendResolvedHint.SetText(fmt.Sprintf("Auto resolved to: %s", strings.ToUpper(backend)))
-				} else {
-					backendResolvedHint.SetText("")
-				}
+				cpuResolvedHint.SetText(fmt.Sprintf("Detected logical CPUs: %d", len(list)))
 				devicesBox.Objects = newObjects
 				devicesBox.Refresh()
 				refreshBtn.Enable()
@@ -1217,7 +1158,6 @@ func main() {
 		}()
 	}
 	refreshBtn.OnTapped = refreshDevices
-	backendSelect.OnChanged = func(_ string) { refreshDevices() }
 
 	var (
 		procMu             sync.Mutex
@@ -1273,7 +1213,7 @@ func main() {
 			sharesValue.SetText("—")
 			poolValue.SetText("—")
 			uptimeValue.SetText("—")
-			backendInUseValue.SetText("—")
+			threadsInUseValue.SetText("—")
 			currentBlockValue.SetText("—")
 			currentDifficultyValue.SetText("—")
 			lastFoundBlockValue.SetText("—")
@@ -1284,7 +1224,11 @@ func main() {
 			lastStatMu.Unlock()
 			updateStatsTable(Stat{})
 			if startBtn != nil {
-				startBtn.Enable()
+				if xmrigErr == nil {
+					startBtn.Enable()
+				} else {
+					startBtn.Disable()
+				}
 			}
 			if stopBtn != nil {
 				stopBtn.Disable()
@@ -1345,11 +1289,27 @@ func main() {
 			}
 		}
 
+		cpuThreads := 0
+		if txt := strings.TrimSpace(threadsEntry.Text); txt != "" {
+			cpuThreads, err = strconv.Atoi(txt)
+			if err != nil || cpuThreads < 0 || cpuThreads > 4096 {
+				return errors.New("invalid CPU threads value (0..4096)")
+			}
+		}
+
 		displayIntv := 10
 		if strings.TrimSpace(displayIntervalEntry.Text) != "" {
 			displayIntv, err = strconv.Atoi(strings.TrimSpace(displayIntervalEntry.Text))
 			if err != nil || displayIntv < 1 || displayIntv > 1800 {
 				return errors.New("invalid display interval (1..1800)")
+			}
+		}
+
+		donateLevel := 0
+		if txt := strings.TrimSpace(donateEntry.Text); txt != "" {
+			donateLevel, err = strconv.Atoi(txt)
+			if err != nil || donateLevel < 0 || donateLevel > 100 {
+				return errors.New("invalid donate level (0..100)")
 			}
 		}
 
@@ -1363,7 +1323,6 @@ func main() {
 		devMu.Unlock()
 
 		cfg.Mode = mode
-		cfg.Backend = selectedBackend()
 		cfg.StratumHost = host
 		cfg.StratumPort = port
 		cfg.RPCURL = rpcURL
@@ -1373,10 +1332,14 @@ func main() {
 			cfg.WalletAddress = wallet
 		}
 		cfg.WorkerName = worker
-		cfg.SelectedDevices = selected
-		cfg.ReportHashrate = reportHashrateCheck.Checked
+		cfg.CPUThreads = cpuThreads
+		cfg.CPUAffinity = selected
+		cfg.SelectedDevices = append([]int(nil), selected...)
+		cfg.UseHugePages = hugePagesCheck.Checked
+		cfg.EnableMSR = msrCheck.Checked
+		cfg.AutoGrantMSR = autoMSRCheck.Checked
+		cfg.DonateLevel = donateLevel
 		cfg.DisplayInterval = displayIntv
-		cfg.HWMon = hwmonCheck.Checked
 
 		cfg.NodeEnabled = nodeEnabledCheck.Checked
 		cfg.NodeMode = selectedNodeMode()
@@ -1455,7 +1418,6 @@ func main() {
 
 	saveDraftFromUI := func() {
 		cfg.Mode = selectedMode()
-		cfg.Backend = selectedBackend()
 
 		if host := strings.TrimSpace(hostEntry.Text); host != "" {
 			cfg.StratumHost = host
@@ -1479,8 +1441,9 @@ func main() {
 
 		cfg.WalletAddress = strings.TrimSpace(walletEntry.Text)
 		cfg.WorkerName = strings.TrimSpace(workerEntry.Text)
-		cfg.ReportHashrate = reportHashrateCheck.Checked
-		cfg.HWMon = hwmonCheck.Checked
+		cfg.UseHugePages = hugePagesCheck.Checked
+		cfg.EnableMSR = msrCheck.Checked
+		cfg.AutoGrantMSR = autoMSRCheck.Checked
 
 		if diText := strings.TrimSpace(displayIntervalEntry.Text); diText != "" {
 			if di, err := strconv.Atoi(diText); err == nil && di >= 1 && di <= 1800 {
@@ -1488,6 +1451,17 @@ func main() {
 			}
 		} else if cfg.DisplayInterval == 0 {
 			cfg.DisplayInterval = 10
+		}
+
+		if txt := strings.TrimSpace(threadsEntry.Text); txt != "" {
+			if v, err := strconv.Atoi(txt); err == nil && v >= 0 && v <= 4096 {
+				cfg.CPUThreads = v
+			}
+		}
+		if txt := strings.TrimSpace(donateEntry.Text); txt != "" {
+			if v, err := strconv.Atoi(txt); err == nil && v >= 0 && v <= 100 {
+				cfg.DonateLevel = v
+			}
 		}
 
 		var selected []int
@@ -1498,7 +1472,8 @@ func main() {
 			}
 		}
 		devMu.Unlock()
-		cfg.SelectedDevices = selected
+		cfg.CPUAffinity = selected
+		cfg.SelectedDevices = append([]int(nil), selected...)
 
 		cfg.NodeEnabled = nodeEnabledCheck.Checked
 		cfg.NodeMode = selectedNodeMode()
@@ -1740,7 +1715,7 @@ func main() {
 			// We'll enable the mining service after the initial sync completes.
 			autoStartMiningServiceAfterSync = true
 			args = append(args,
-				"--miner.recommit=1s",
+				"--miner.recommit=10s",
 				"--miner.etherbase", settings.Wallet,
 			)
 		}
@@ -2180,8 +2155,8 @@ func main() {
 	}
 
 	startMinerWithOrigin = func(origin minerStartOrigin) error {
-		if ethminerErr != nil {
-			return fmt.Errorf("ethminer not found: %w", ethminerErr)
+		if xmrigErr != nil {
+			return fmt.Errorf("xmrig not found: %w", xmrigErr)
 		}
 		if origin == minerStartOriginUser {
 			if err := saveFromUI(); err != nil {
@@ -2229,7 +2204,11 @@ func main() {
 			}
 			host := u.Host
 			if !strings.Contains(host, ":") {
-				host += ":80"
+				if strings.Contains(strings.ToLower(u.Scheme), "https") {
+					host += ":443"
+				} else {
+					host += ":80"
+				}
 			}
 			conn, err := net.DialTimeout("tcp", host, 750*time.Millisecond)
 			if err != nil {
@@ -2239,37 +2218,75 @@ func main() {
 			_ = conn.Close()
 		}
 
-		backendSelection := cfg.Backend
-		backend := resolveBackend(ethminerPath, backendSelection)
+		resetMinerLog()
+
 		args := []string{
-			"-G",
-			"--olivetum",
-			"--nocolor",
-			"-P", poolURL,
-			"--api-bind", fmt.Sprintf("127.0.0.1:-%d", apiPort),
-			"--display-interval", strconv.Itoa(cfg.DisplayInterval),
+			"--no-color",
+			"-o", poolURL,
+			"--coin", "OLIVO",
+			"--http-host", "127.0.0.1",
+			"--http-port", strconv.Itoa(apiPort),
+			"--donate-level", strconv.Itoa(cfg.DonateLevel),
 		}
-		if cfg.HWMon {
-			args = append(args, "--HWMON", "2")
-		}
-		if backend == backendCUDA {
-			args[0] = "-U"
-		}
-		if cfg.Mode == modeStratum && cfg.ReportHashrate {
-			args = append(args, "--report-hashrate")
-		}
-		if len(cfg.SelectedDevices) > 0 {
-			if backend == backendCUDA {
-				args = append(args, "--cu-devices")
-			} else {
-				args = append(args, "--cl-devices")
+		if cfg.Mode == modeStratum {
+			user := cfg.WalletAddress
+			if cfg.WorkerName != "" {
+				user = user + "." + cfg.WorkerName
 			}
-			for _, idx := range cfg.SelectedDevices {
-				args = append(args, strconv.Itoa(idx))
+			args = append(args, "-u", user, "-p", "x")
+		} else if cfg.Mode == modeRPCGateway {
+			args = append(args, "-u", cfg.WalletAddress)
+		}
+		if cfg.Mode != modeStratum {
+			args = append(args, "--daemon")
+		}
+		if cfg.DisplayInterval > 0 {
+			args = append(args, "--print-time", strconv.Itoa(cfg.DisplayInterval))
+		}
+		if cfg.CPUThreads > 0 {
+			args = append(args, "-t", strconv.Itoa(cfg.CPUThreads))
+		}
+		if len(cfg.CPUAffinity) > 0 {
+			mask, ok := affinityMask(cfg.CPUAffinity)
+			if ok {
+				args = append(args, "--cpu-affinity", mask, "-t", strconv.Itoa(len(cfg.CPUAffinity)))
+			} else {
+				appendMinerLog("[cpu] Affinity contains CPU index >= 64, skipping affinity mask.\n")
+				args = append(args, "-t", strconv.Itoa(len(cfg.CPUAffinity)))
+			}
+		}
+		if !cfg.UseHugePages {
+			args = append(args, "--no-huge-pages")
+		}
+		if !cfg.EnableMSR {
+			args = append(args, "--randomx-wrmsr=-1")
+		}
+
+		runXMRigPath := xmrigPath
+		if runtime.GOOS == "linux" {
+			p, err := prepareXMRigBinary(xmrigPath)
+			if err != nil {
+				procMu.Unlock()
+				return err
+			}
+			runXMRigPath = p
+			if cfg.EnableMSR && cfg.AutoGrantMSR {
+				if err := ensureLinuxMSRAccess(runXMRigPath); err != nil {
+					appendMinerLog(fmt.Sprintf("[msr] Auto grant failed: %v\n", err))
+				}
+			}
+			if cfg.EnableMSR {
+				if ok, err := hasLinuxMSRCaps(runXMRigPath); err == nil {
+					if ok {
+						appendMinerLog("[msr] CAP_SYS_RAWIO and CAP_DAC_OVERRIDE detected on xmrig binary.\n")
+					} else {
+						appendMinerLog("[msr] Required Linux capabilities missing (CAP_SYS_RAWIO + CAP_DAC_OVERRIDE); MSR tweak may fail.\n")
+					}
+				}
 			}
 		}
 
-		setMinerDeviceMap(cfg.SelectedDevices)
+		setMinerDeviceMap(cfg.CPUAffinity)
 
 		minerStartedAt.Store(time.Now().UnixNano())
 		lastJobAt.Store(0)
@@ -2278,15 +2295,14 @@ func main() {
 		jobDifficulty.Store("")
 
 		minerCtx, minerCancel = context.WithCancel(context.Background())
-		cmd := exec.CommandContext(minerCtx, ethminerPath, args...)
+		cmd := exec.CommandContext(minerCtx, runXMRigPath, args...)
 		configureChildProcess(cmd)
 		cmd.Env = append(os.Environ(), "LC_ALL=C")
 
 		stdout, _ := cmd.StdoutPipe()
 		stderr, _ := cmd.StderrPipe()
 
-		resetMinerLog()
-		appendMinerLog(fmt.Sprintf("Starting: %s %s\n\n", ethminerPath, strings.Join(args, " ")))
+		appendMinerLog(fmt.Sprintf("Starting: %s %s\n\n", runXMRigPath, strings.Join(args, " ")))
 
 		if err := cmd.Start(); err != nil {
 			minerCancel()
@@ -2304,10 +2320,12 @@ func main() {
 		procMu.Unlock()
 
 		setRunningUI(true)
-		if backendSelection == backendAuto {
-			backendInUseValue.SetText(fmt.Sprintf("Auto → %s", strings.ToUpper(backend)))
+		if len(cfg.CPUAffinity) > 0 {
+			threadsInUseValue.SetText(fmt.Sprintf("%d", len(cfg.CPUAffinity)))
+		} else if cfg.CPUThreads > 0 {
+			threadsInUseValue.SetText(fmt.Sprintf("%d", cfg.CPUThreads))
 		} else {
-			backendInUseValue.SetText(strings.ToUpper(backend))
+			threadsInUseValue.SetText(fmt.Sprintf("%d", runtime.NumCPU()))
 		}
 
 		if origin == minerStartOriginUser && cfg.WatchdogEnabled {
@@ -2321,7 +2339,7 @@ func main() {
 		go streamLines(stdout, appendMinerLog)
 		go streamLines(stderr, appendMinerLog)
 
-		go pollStats(pollCtx, "127.0.0.1", apiPort, cfg.HWMon, func(s Stat) {
+		go pollStats(pollCtx, "127.0.0.1", apiPort, true, func(s Stat) {
 			if deviceMap := getMinerDeviceMap(); len(deviceMap) > 0 {
 				maxSelected := -1
 				identity := true
@@ -2400,17 +2418,42 @@ func main() {
 			lastStatMu.Lock()
 			lastStat = &statCopy
 			lastStatMu.Unlock()
-			hs := fmt.Sprintf("%.2f MH/s", float64(s.TotalKHs)/1000.0)
+			totalHashrate := s.TotalHashrate
+			if totalHashrate <= 0 {
+				totalHashrate = float64(s.TotalKHs)
+			}
+			if totalHashrate <= 0 {
+				for _, v := range s.PerGPU_KHs {
+					if v > 0 {
+						totalHashrate += float64(v)
+					}
+				}
+			}
+			threadCount := s.ActiveThreads
+			if threadCount <= 0 {
+				if len(cfg.CPUAffinity) > 0 {
+					threadCount = len(cfg.CPUAffinity)
+				} else if cfg.CPUThreads > 0 {
+					threadCount = cfg.CPUThreads
+				} else if len(s.PerGPU_KHs) > 0 {
+					threadCount = len(s.PerGPU_KHs)
+				}
+			}
 			fyne.Do(func() {
 				if firstStat {
 					setStatusText("Running")
 					setConnectionBadge("Conn: Live", connLiveColor)
 				}
-				hashrateValue.Text = hs
+				hashrateValue.Text = formatHashrate(totalHashrate)
 				hashrateValue.Refresh()
-				hashrateHistory.Add(float64(s.TotalKHs) / 1000.0)
+				hashrateHistory.Add(totalHashrate)
+				if threadCount > 0 {
+					threadsInUseValue.SetText(fmt.Sprintf("%d", threadCount))
+				} else {
+					threadsInUseValue.SetText("—")
+				}
 				if avg, ok := hashrateHistory.Average(); ok {
-					avgHashrateValue.SetText(fmt.Sprintf("Avg %.2f MH/s", avg))
+					avgHashrateValue.SetText(fmt.Sprintf("Avg %s", formatHashrate(avg)))
 				} else {
 					avgHashrateValue.SetText("Avg —")
 				}
@@ -2438,7 +2481,12 @@ func main() {
 				updateStatsTable(statCopy)
 			})
 		}, func(err error) {
-			// Only show transient failures in log; API might not be ready yet.
+			if waitingForStats.Load() {
+				msg := strings.ToLower(err.Error())
+				if strings.Contains(msg, "connection refused") || strings.Contains(msg, "no such host") {
+					return
+				}
+			}
 			appendMinerLog(fmt.Sprintf("[api] %v\n", err))
 		})
 
@@ -2497,7 +2545,7 @@ func main() {
 	stopBtn = widget.NewButtonWithIcon("Stop", theme.MediaStopIcon(), stopMinerUser)
 	stopBtn.Importance = widget.DangerImportance
 
-	if ethminerErr != nil {
+	if xmrigErr != nil {
 		startBtn.Disable()
 		stopBtn.Disable()
 	} else {
@@ -2686,17 +2734,19 @@ func main() {
 	watchdogPanel := panel("Watchdog", watchdogBody)
 
 	hardwareGrid := container.NewGridWithColumns(2,
-		fieldLabel("GPU backend"), backendSelect,
+		fieldLabel("CPU threads"), threadsEntry,
 		fieldLabel("Display interval (s)"), displayIntervalEntry,
-		fieldLabel("Hardware monitoring"), hwmonCheck,
-		widget.NewLabel(""), reportHashrateCheck,
+		fieldLabel("Donate level"), donateEntry,
+		widget.NewLabel(""), hugePagesCheck,
+		widget.NewLabel(""), msrCheck,
+		widget.NewLabel(""), autoMSRCheck,
 	)
 	hardwareBody := container.NewVBox(
 		hardwareGrid,
-		backendHint,
-		backendResolvedHint,
+		cpuHint,
+		cpuResolvedHint,
 		widget.NewSeparator(),
-		container.NewHBox(fieldLabel("GPUs"), layout.NewSpacer(), refreshBtn),
+		container.NewHBox(fieldLabel("CPUs"), layout.NewSpacer(), refreshBtn),
 		devicesScroll,
 	)
 	hardwarePanel := panel("Hardware", hardwareBody)
@@ -2712,14 +2762,13 @@ func main() {
 	hashrate10mHeader := container.NewHBox(widget.NewIcon(theme.HistoryIcon()), hashrate10mTitle, layout.NewSpacer(), avgHashrateValue)
 
 	overviewGrid := container.NewGridWithColumns(4,
-		metricTileWithIcon("Backend", theme.ComputerIcon(), backendInUseValue),
+		metricTileWithIcon("Threads", theme.ComputerIcon(), threadsInUseValue),
 		metricTileWithIcon("Uptime", theme.HistoryIcon(), uptimeValue),
 		sharesTile,
 		metricTileWithIcon("Pool", theme.StorageIcon(), poolValue),
 	)
-	jobRow := container.New(&centeredTileRowLayout{Columns: 4},
+	jobRow := container.New(&centeredTileRowLayout{Columns: 2},
 		metricTileWithIcon("Current mining block", iconPickaxeWhite, currentBlockValue),
-		metricTileWithIcon("Difficulty", theme.InfoIcon(), currentDifficultyValue),
 		metricTileWithIcon("Last found", theme.SearchIcon(), lastFoundBlockValue),
 	)
 	overviewBody := container.NewVBox(
@@ -2733,7 +2782,7 @@ func main() {
 	statsScroll := container.NewVScroll(statsTable)
 	statsScroll.SetMinSize(fyne.NewSize(0, 220))
 	statsBody := container.NewVBox(statsHeaderRow, widget.NewSeparator(), statsScroll)
-	statsPanel := panel("Per-GPU", statsBody)
+	statsPanel := panel("Per-CPU", statsBody)
 	dashboardStack := container.NewVBox(overviewPanel, hashratePanel, statsPanel)
 	dashboardTab := container.NewPadded(container.NewVScroll(dashboardStack))
 
@@ -2785,7 +2834,7 @@ func main() {
 	headerTitle := canvas.NewText(appName, theme.Color(theme.ColorNamePrimary))
 	headerTitle.TextStyle = fyne.TextStyle{Bold: true}
 	headerTitle.TextSize = theme.TextSize() * 2.1
-	headerSubtitle := widget.NewLabel("Modern GUI for ethminer (Olivetumhash)")
+	headerSubtitle := widget.NewLabel("Modern GUI for XMRig RandomX (Olivetum)")
 	headerSubtitle.Wrapping = fyne.TextWrapWord
 
 	statusPillBg := canvas.NewRectangle(theme.Color(theme.ColorNameButton))
@@ -2827,8 +2876,8 @@ func main() {
 	w.SetContent(container.NewMax(bg, main))
 	refreshTimeSync(false)
 
-	if ethminerErr != nil {
-		dialog.ShowError(fmt.Errorf("ethminer not found. Place it next to this app or in PATH: %w", ethminerErr), w)
+	if xmrigErr != nil {
+		dialog.ShowError(fmt.Errorf("xmrig not found. Place it next to this app or in PATH: %w", xmrigErr), w)
 	} else {
 		refreshDevices()
 	}
@@ -2869,17 +2918,20 @@ func main() {
 
 func loadConfig() *Config {
 	cfg := &Config{
-		Mode:            modeStratum,
-		Backend:         backendAuto,
-		StratumHost:     defaultStratumHost,
-		StratumPort:     defaultStratumPort,
-		RPCURL:          defaultRPCURL,
-		WalletAddress:   "",
-		WorkerName:      "",
-		SelectedDevices: nil,
-		ReportHashrate:  true,
+		Mode:          modeStratum,
+		StratumHost:   defaultStratumHost,
+		StratumPort:   defaultStratumPort,
+		RPCURL:        defaultRPCURL,
+		WalletAddress: "",
+		WorkerName:    "",
+
+		CPUThreads:      0,
+		CPUAffinity:     nil,
+		UseHugePages:    true,
+		EnableMSR:       true,
+		AutoGrantMSR:    true,
+		DonateLevel:     0,
 		DisplayInterval: 10,
-		HWMon:           false,
 
 		NodeEnabled:   false,
 		NodeMode:      nodeModeSync,
@@ -2916,17 +2968,20 @@ func loadConfig() *Config {
 	if cfg.Mode != modeStratum && cfg.Mode != modeRPCLocal && cfg.Mode != modeRPCGateway {
 		cfg.Mode = modeStratum
 	}
-	if cfg.Backend == "" {
-		cfg.Backend = backendAuto
-	}
-	if cfg.Backend != backendAuto && cfg.Backend != backendCUDA && cfg.Backend != backendOpenCL {
-		cfg.Backend = backendAuto
-	}
 	if cfg.RPCURL == "" {
 		cfg.RPCURL = defaultRPCURL
 	}
 	if cfg.DisplayInterval == 0 {
 		cfg.DisplayInterval = 10
+	}
+	if cfg.CPUThreads < 0 {
+		cfg.CPUThreads = 0
+	}
+	if len(cfg.CPUAffinity) == 0 && len(cfg.SelectedDevices) > 0 {
+		cfg.CPUAffinity = append([]int(nil), cfg.SelectedDevices...)
+	}
+	if cfg.DonateLevel < 0 || cfg.DonateLevel > 100 {
+		cfg.DonateLevel = 0
 	}
 	if cfg.NodeMode != nodeModeSync && cfg.NodeMode != nodeModeMine {
 		cfg.NodeMode = nodeModeSync
@@ -3024,8 +3079,8 @@ func normalizeRPCURL(s string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("invalid RPC URL: %w", err)
 	}
-	if u.Scheme != "http" && u.Scheme != "getwork" {
-		return "", fmt.Errorf("unsupported RPC URL scheme: %q (use http://)", u.Scheme)
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", fmt.Errorf("unsupported RPC URL scheme: %q (use http:// or https://)", u.Scheme)
 	}
 	if u.Host == "" {
 		return "", errors.New("invalid RPC URL: missing host")
@@ -3048,14 +3103,18 @@ func buildPoolURL(cfg *Config) (string, error) {
 		if !isHexAddress(cfg.WalletAddress) {
 			return "", errors.New("invalid wallet address (expected 0x + 40 hex chars)")
 		}
-		user := cfg.WalletAddress
-		if cfg.WorkerName != "" {
-			user = user + "." + cfg.WorkerName
-		}
-		return fmt.Sprintf("stratum1+tcp://%s@%s:%d", user, cfg.StratumHost, cfg.StratumPort), nil
+		return fmt.Sprintf("stratum1+tcp://%s:%d", cfg.StratumHost, cfg.StratumPort), nil
 
 	case modeRPCLocal:
-		return normalizeRPCURL(cfg.RPCURL)
+		rpcURL, err := normalizeRPCURL(cfg.RPCURL)
+		if err != nil {
+			return "", err
+		}
+		u, err := url.Parse(rpcURL)
+		if err != nil {
+			return "", fmt.Errorf("invalid RPC URL: %w", err)
+		}
+		return fmt.Sprintf("daemon+%s://%s", u.Scheme, u.Host), nil
 
 	case modeRPCGateway:
 		if !isHexAddress(cfg.WalletAddress) {
@@ -3069,23 +3128,17 @@ func buildPoolURL(cfg *Config) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("invalid RPC URL: %w", err)
 		}
-		if u.Scheme != "http" {
-			return "", errors.New("RPC gateway requires http:// RPC URL")
-		}
-		if u.Path != "" && u.Path != "/" {
-			return "", errors.New("RPC gateway requires RPC URL without a path")
-		}
-		return fmt.Sprintf("solo+http://%s/%s", u.Host, cfg.WalletAddress), nil
+		return fmt.Sprintf("daemon+%s://%s", u.Scheme, u.Host), nil
 
 	default:
 		return "", fmt.Errorf("unknown mining mode: %q", cfg.Mode)
 	}
 }
 
-func findEthminer() (string, error) {
-	names := []string{"ethminer"}
+func findXMRig() (string, error) {
+	names := []string{"xmrig"}
 	if runtime.GOOS == "windows" {
-		names = []string{"ethminer.exe", "ethminer"}
+		names = []string{"xmrig.exe", "xmrig"}
 	}
 	exe, err := os.Executable()
 	if err == nil {
@@ -3097,70 +3150,203 @@ func findEthminer() (string, error) {
 			}
 		}
 	}
+	if env := strings.TrimSpace(os.Getenv("OLIVETUM_XMRIG_PATH")); env != "" {
+		if st, err := os.Stat(env); err == nil && !st.IsDir() {
+			return env, nil
+		}
+	}
 	for _, name := range names {
 		p, err := exec.LookPath(name)
 		if err == nil {
 			return p, nil
 		}
 	}
-	return "", errors.New("ethminer not found")
+	return "", errors.New("xmrig not found")
 }
 
-var deviceLine = regexp.MustCompile(`^\s*(\d+)\s+(\S+)\s+\S+\s+(.+?)\s+(Yes|No)\s+`)
-var gpuStatLine = regexp.MustCompile(`\b(?:cu|cl)(\d+)\s+(?:[0-9]+(?:\.[0-9]+)?\s+)?(\d+)C\s+(\d+)%\s+([0-9]+(?:\.[0-9]+)?)W\b`)
-var jobBlockLine = regexp.MustCompile(`\bJob:\s+\S+\s+block\s+(\d+)\b`)
-var nodeMinedPotentialBlockLine = regexp.MustCompile(`\bMined potential block\b.*\bnumber=([0-9,]+)\b`)
-var nodeSealedNewBlockLine = regexp.MustCompile(`\bSuccessfully sealed new block\b.*\bnumber=([0-9,]+)\b`)
-
-func resolveBackend(ethminerPath string, backend string) string {
-	if backend != backendAuto {
-		return backend
-	}
-	if ethminerPath == "" {
-		return backendOpenCL
-	}
-	list, _, err := listEthminerDevices(ethminerPath, backendCUDA)
-	if err == nil && len(list) > 0 {
-		return backendCUDA
-	}
-	return backendOpenCL
-}
-
-func listEthminerDevices(ethminerPath, backend string) ([]Device, string, error) {
-	args := []string{"--list-devices"}
-	if backend == backendCUDA {
-		args = append([]string{"-U"}, args...)
-	} else {
-		args = append([]string{"-G"}, args...)
-	}
-	cmd := exec.Command(ethminerPath, args...)
-	configureChildProcess(cmd)
-	cmd.Env = append(os.Environ(), "LC_ALL=C")
-	out, err := cmd.CombinedOutput()
-	outStr := string(out)
+func prepareXMRigBinary(src string) (string, error) {
+	cacheDir, err := os.UserCacheDir()
 	if err != nil {
-		return nil, outStr, fmt.Errorf("failed to list devices: %w\n%s", err, outStr)
+		return "", err
 	}
-	var res []Device
-	sc := bufio.NewScanner(strings.NewReader(outStr))
-	for sc.Scan() {
-		line := sc.Text()
-		m := deviceLine.FindStringSubmatch(line)
-		if len(m) == 0 {
+	dstDir := filepath.Join(cacheDir, configDirName, "pkexec-bin")
+	if err := os.MkdirAll(dstDir, 0o755); err != nil {
+		return "", err
+	}
+	name := "xmrig"
+	if runtime.GOOS == "windows" {
+		name = "xmrig.exe"
+	}
+	dst := filepath.Join(dstDir, name)
+
+	needCopy := true
+	srcInfo, srcErr := os.Stat(src)
+	if srcErr == nil {
+		if dstInfo, dstErr := os.Stat(dst); dstErr == nil && !dstInfo.IsDir() {
+			if dstInfo.Size() == srcInfo.Size() && dstInfo.ModTime().Equal(srcInfo.ModTime()) {
+				needCopy = false
+			}
+		}
+	}
+
+	if needCopy {
+		data, err := os.ReadFile(src)
+		if err != nil {
+			return "", err
+		}
+		if err := os.WriteFile(dst, data, 0o755); err != nil {
+			return "", err
+		}
+		if srcErr == nil {
+			_ = os.Chtimes(dst, srcInfo.ModTime(), srcInfo.ModTime())
+		}
+	}
+
+	return dst, nil
+}
+
+func ensureLinuxMSRAccess(binaryPath string) error {
+	if runtime.GOOS != "linux" || os.Geteuid() == 0 {
+		return nil
+	}
+
+	getcapPath, getcapErr := exec.LookPath("getcap")
+	hasCaps := false
+	if getcapErr == nil {
+		out, err := exec.Command(getcapPath, binaryPath).CombinedOutput()
+		if err == nil && hasMSRCapsInGetcapOutput(string(out)) {
+			hasCaps = true
+		}
+	}
+	if hasCaps {
+		return nil
+	}
+
+	pkexecPath, err := exec.LookPath("pkexec")
+	if err != nil {
+		return errors.New("pkexec not found")
+	}
+	setcapPath, err := exec.LookPath("setcap")
+	if err != nil {
+		return errors.New("setcap not found")
+	}
+
+	out, err := exec.Command(pkexecPath, setcapPath, "cap_sys_rawio,cap_dac_override+ep", binaryPath).CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(out))
+		if msg == "" {
+			msg = err.Error()
+		}
+		return fmt.Errorf("%s", msg)
+	}
+
+	if getcapErr == nil {
+		out, err := exec.Command(getcapPath, binaryPath).CombinedOutput()
+		if err != nil || !hasMSRCapsInGetcapOutput(string(out)) {
+			return errors.New("required capabilities were not applied")
+		}
+	}
+
+	return nil
+}
+
+func hasLinuxMSRCaps(binaryPath string) (bool, error) {
+	if runtime.GOOS != "linux" {
+		return false, nil
+	}
+	getcapPath, err := exec.LookPath("getcap")
+	if err != nil {
+		return false, err
+	}
+	out, err := exec.Command(getcapPath, binaryPath).CombinedOutput()
+	if err != nil {
+		return false, err
+	}
+	return hasMSRCapsInGetcapOutput(string(out)), nil
+}
+
+func hasMSRCapsInGetcapOutput(output string) bool {
+	line := strings.ToLower(output)
+	return strings.Contains(line, "cap_sys_rawio") && strings.Contains(line, "cap_dac_override")
+}
+
+func listCPUDevices() ([]Device, error) {
+	cmd := exec.Command("lscpu", "-p=CPU,CORE,SOCKET,NODE")
+	out, err := cmd.Output()
+	if err != nil {
+		n := runtime.NumCPU()
+		if n < 1 {
+			return nil, err
+		}
+		res := make([]Device, 0, n)
+		for i := 0; i < n; i++ {
+			res = append(res, Device{
+				Index: i,
+				Name:  fmt.Sprintf("Logical CPU %d", i),
+			})
+		}
+		return res, nil
+	}
+
+	lines := strings.Split(string(out), "\n")
+	res := make([]Device, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		idx, _ := strconv.Atoi(m[1])
+		parts := strings.Split(line, ",")
+		if len(parts) < 4 {
+			continue
+		}
+		cpu, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+		if err != nil {
+			continue
+		}
+		core := strings.TrimSpace(parts[1])
+		socket := strings.TrimSpace(parts[2])
+		node := strings.TrimSpace(parts[3])
+
+		name := fmt.Sprintf("Logical CPU %d", cpu)
+		meta := []string{}
+		if core != "" && core != "-1" {
+			meta = append(meta, "core "+core)
+		}
+		if socket != "" && socket != "-1" {
+			meta = append(meta, "socket "+socket)
+		}
+		if node != "" && node != "-1" {
+			meta = append(meta, "numa "+node)
+		}
+		if len(meta) > 0 {
+			name = fmt.Sprintf("%s [%s]", name, strings.Join(meta, ", "))
+		}
+
 		res = append(res, Device{
-			Index: idx,
-			PCI:   m[2],
-			Name:  strings.TrimSpace(m[3]),
+			Index: cpu,
+			Name:  name,
+			PCI:   "",
 		})
 	}
-	if err := sc.Err(); err != nil {
-		return nil, outStr, err
-	}
-	return res, outStr, nil
+
+	sort.Slice(res, func(i, j int) bool { return res[i].Index < res[j].Index })
+	return res, nil
 }
+
+func affinityMask(cpuIDs []int) (string, bool) {
+	var mask uint64
+	for _, id := range cpuIDs {
+		if id < 0 || id >= 64 {
+			return "", false
+		}
+		mask |= (uint64(1) << uint(id))
+	}
+	return fmt.Sprintf("0x%x", mask), true
+}
+
+var xmrigJobLine = regexp.MustCompile(`\bnew job\b.*\bdiff\s+([^\s]+)\b.*\bheight\s+(\d+)`)
+var nodeMinedPotentialBlockLine = regexp.MustCompile(`\bMined potential block\b.*\bnumber=([0-9,]+)\b`)
+var nodeSealedNewBlockLine = regexp.MustCompile(`\bSuccessfully sealed new block\b.*\bnumber=([0-9,]+)\b`)
 
 func pickFreePort() (int, error) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -3197,227 +3383,172 @@ type deviceSensors struct {
 	Power float64
 }
 
-type detailSnapshot struct {
-	Sensors    map[int]deviceSensors
-	Labels     map[int]string
-	Hashes     map[int]int64
-	Difficulty float64
+type xmrigSummary struct {
+	Version string `json:"version"`
+	Uptime  int64  `json:"uptime"`
+	Algo    string `json:"algo"`
+	Results struct {
+		DiffCurrent float64 `json:"diff_current"`
+		SharesGood  int64   `json:"shares_good"`
+		SharesTotal int64   `json:"shares_total"`
+	} `json:"results"`
+	Connection struct {
+		Pool     string  `json:"pool"`
+		Diff     float64 `json:"diff"`
+		Accepted int64   `json:"accepted"`
+		Rejected int64   `json:"rejected"`
+	} `json:"connection"`
+	Hashrate struct {
+		Total   []*float64   `json:"total"`
+		Threads [][]*float64 `json:"threads"`
+	} `json:"hashrate"`
 }
 
-type statDetail struct {
-	Devices []struct {
-		Index    int `json:"_index"`
-		Hardware struct {
-			Name    string    `json:"name"`
-			PCI     string    `json:"pci"`
-			Sensors []float64 `json:"sensors"`
-		} `json:"hardware"`
-		Mining struct {
-			Hashrate string `json:"hashrate"`
-		} `json:"mining"`
-	} `json:"devices"`
-	Mining struct {
-		Difficulty float64 `json:"difficulty"`
-	} `json:"mining"`
+type xmrigBackends []struct {
+	Type    string `json:"type"`
+	Enabled bool   `json:"enabled"`
+	Threads []struct {
+		Affinity int        `json:"affinity"`
+		Hashrate []*float64 `json:"hashrate"`
+	} `json:"threads"`
 }
 
-func pollStats(ctx context.Context, host string, port int, detail bool, onStat func(Stat), onErr func(error)) {
+func pollStats(ctx context.Context, host string, port int, _ bool, onStat func(Stat), onErr func(error)) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
-
-	detailEvery := 3     // 6s cadence for sensors/hwmon
-	difficultyEvery := 5 // 10s cadence for mining info
-	detailTick := detailEvery - 1
-	difficultyTick := difficultyEvery - 1
-	var cachedDetail detailSnapshot
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			st, err := getStat1(host, port)
+			st, err := getSummary(host, port)
 			if err != nil {
 				onErr(err)
 				continue
 			}
-			needSensors := detail || len(st.PerGPU_KHs) == 0
-			needDetailCall := false
-			if needSensors {
-				detailTick++
-				if detailTick >= detailEvery || (len(cachedDetail.Sensors) == 0 && len(cachedDetail.Hashes) == 0) {
-					detailTick = 0
-					needDetailCall = true
-				}
+
+			backends, err := getBackends(host, port)
+			if err != nil {
+				onErr(err)
+			} else {
+				applyBackends(&st, backends)
 			}
-			difficultyTick++
-			if difficultyTick >= difficultyEvery || cachedDetail.Difficulty == 0 {
-				difficultyTick = 0
-				needDetailCall = true
-			}
-			if needDetailCall {
-				snapshot, err := getStatDetail(host, port)
-				if err != nil {
-					onErr(err)
-				} else {
-					cachedDetail = snapshot
-				}
-			}
-			applyDetail(&st, cachedDetail)
+
 			onStat(st)
 		}
 	}
 }
 
-func getStat1(host string, port int) (Stat, error) {
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", host, port), 1*time.Second)
+func getSummary(host string, port int) (Stat, error) {
+	endpoint := fmt.Sprintf("http://%s:%d/1/summary", host, port)
+	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
 	if err != nil {
 		return Stat{}, err
 	}
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(1500 * time.Millisecond))
-
-	req := `{"id":1,"jsonrpc":"2.0","method":"miner_getstat1"}`
-	if _, err := io.WriteString(conn, req+"\n"); err != nil {
-		return Stat{}, err
-	}
-	line, err := bufio.NewReader(conn).ReadBytes('\n')
+	client := &http.Client{Timeout: 1500 * time.Millisecond}
+	resp, err := client.Do(req)
 	if err != nil {
 		return Stat{}, err
 	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return Stat{}, fmt.Errorf("summary status %d", resp.StatusCode)
+	}
 
-	var resp apiResp
-	if err := json.Unmarshal(line, &resp); err != nil {
+	var summary xmrigSummary
+	if err := json.NewDecoder(resp.Body).Decode(&summary); err != nil {
 		return Stat{}, err
 	}
-	if resp.Error != nil {
-		return Stat{}, fmt.Errorf("api error: %v", resp.Error)
+
+	st := Stat{
+		Version:   summary.Version,
+		UptimeMin: int(summary.Uptime / 60),
+		Pool:      summary.Connection.Pool,
+		Difficulty: func() float64 {
+			if summary.Connection.Diff > 0 {
+				return summary.Connection.Diff
+			}
+			return summary.Results.DiffCurrent
+		}(),
 	}
-	var arr []string
-	if err := json.Unmarshal(resp.Result, &arr); err != nil {
-		return Stat{}, err
+	st.TotalHashrate = seriesFirst(summary.Hashrate.Total)
+	st.TotalKHs = int64(math.Round(st.TotalHashrate))
+	st.Accepted = summary.Connection.Accepted
+	if st.Accepted == 0 && summary.Results.SharesGood > 0 {
+		st.Accepted = summary.Results.SharesGood
 	}
-	if len(arr) < 9 {
-		return Stat{}, fmt.Errorf("unexpected stat format (%d items)", len(arr))
+	st.Rejected = summary.Connection.Rejected
+	if summary.Results.SharesTotal > st.Accepted+st.Rejected {
+		st.Invalid = summary.Results.SharesTotal - st.Accepted - st.Rejected
 	}
 
-	st := Stat{Version: arr[0]}
-	st.UptimeMin, _ = strconv.Atoi(arr[1])
-
-	// "kh;accepted;rejected"
-	if parts := strings.Split(arr[2], ";"); len(parts) >= 3 {
-		st.TotalKHs, _ = strconv.ParseInt(parts[0], 10, 64)
-		st.Accepted, _ = strconv.ParseInt(parts[1], 10, 64)
-		st.Rejected, _ = strconv.ParseInt(parts[2], 10, 64)
+	st.ActiveThreads = len(summary.Hashrate.Threads)
+	for _, thread := range summary.Hashrate.Threads {
+		st.PerGPU_KHs = append(st.PerGPU_KHs, int64(math.Round(seriesFirst(thread))))
 	}
 
-	// "kh1;kh2;..."
-	if parts := strings.Split(arr[3], ";"); len(parts) > 0 && parts[0] != "" {
-		for _, p := range parts {
-			v, _ := strconv.ParseInt(p, 10, 64)
-			st.PerGPU_KHs = append(st.PerGPU_KHs, v)
-		}
-	}
-
-	// temps/fans pairs
-	if parts := strings.Split(arr[6], ";"); len(parts) >= 2 {
-		for i := 0; i+1 < len(parts); i += 2 {
-			t, _ := strconv.Atoi(parts[i])
-			f, _ := strconv.Atoi(parts[i+1])
-			st.Temps = append(st.Temps, t)
-			st.Fans = append(st.Fans, f)
-		}
-	}
-
-	st.Pool = arr[7]
-
-	// "ethInvalid;ethSwitches;dcrInvalid;dcrSwitches"
-	if parts := strings.Split(arr[8], ";"); len(parts) >= 2 {
-		st.Invalid, _ = strconv.ParseInt(parts[0], 10, 64)
-		st.PoolSwitches, _ = strconv.ParseInt(parts[1], 10, 64)
-	}
 	return st, nil
 }
 
-func getStatDetail(host string, port int) (detailSnapshot, error) {
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", host, port), 1*time.Second)
+func getBackends(host string, port int) (xmrigBackends, error) {
+	endpoint := fmt.Sprintf("http://%s:%d/2/backends", host, port)
+	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
 	if err != nil {
-		return detailSnapshot{}, err
+		return nil, err
 	}
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(1500 * time.Millisecond))
-
-	req := `{"id":1,"jsonrpc":"2.0","method":"miner_getstatdetail"}`
-	if _, err := io.WriteString(conn, req+"\n"); err != nil {
-		return detailSnapshot{}, err
-	}
-	line, err := bufio.NewReader(conn).ReadBytes('\n')
+	client := &http.Client{Timeout: 1500 * time.Millisecond}
+	resp, err := client.Do(req)
 	if err != nil {
-		return detailSnapshot{}, err
+		return nil, err
 	}
-
-	var resp apiResp
-	if err := json.Unmarshal(line, &resp); err != nil {
-		return detailSnapshot{}, err
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return nil, fmt.Errorf("backends status %d", resp.StatusCode)
 	}
-	if resp.Error != nil {
-		return detailSnapshot{}, fmt.Errorf("api error: %v", resp.Error)
+	var backends xmrigBackends
+	if err := json.NewDecoder(resp.Body).Decode(&backends); err != nil {
+		return nil, err
 	}
-	var detail statDetail
-	if err := json.Unmarshal(resp.Result, &detail); err != nil {
-		return detailSnapshot{}, err
-	}
-
-	snapshot := detailSnapshot{
-		Sensors:    make(map[int]deviceSensors),
-		Labels:     make(map[int]string),
-		Hashes:     make(map[int]int64),
-		Difficulty: detail.Mining.Difficulty,
-	}
-	for _, dev := range detail.Devices {
-		temp := 0
-		fan := 0
-		power := -1.0
-		if len(dev.Hardware.Sensors) >= 1 {
-			temp = int(dev.Hardware.Sensors[0])
-		}
-		if len(dev.Hardware.Sensors) >= 2 {
-			fan = int(dev.Hardware.Sensors[1])
-		}
-		if len(dev.Hardware.Sensors) >= 3 {
-			power = dev.Hardware.Sensors[2]
-		}
-		snapshot.Sensors[dev.Index] = deviceSensors{Temp: temp, Fan: fan, Power: power}
-		if kh, ok := parseHashrateHex(dev.Mining.Hashrate); ok {
-			snapshot.Hashes[dev.Index] = kh
-		}
-
-		name := strings.TrimSpace(dev.Hardware.Name)
-		if name != "" {
-			label := name
-			if pci := strings.TrimSpace(dev.Hardware.PCI); pci != "" {
-				label = fmt.Sprintf("%s (%s)", name, pci)
-			}
-			snapshot.Labels[dev.Index] = label
-		}
-	}
-	return snapshot, nil
+	return backends, nil
 }
 
-func parseHashrateHex(s string) (int64, bool) {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return 0, false
+func applyBackends(st *Stat, backends xmrigBackends) {
+	for i := range backends {
+		backend := backends[i]
+		if backend.Type != "cpu" || len(backend.Threads) == 0 {
+			continue
+		}
+		st.ActiveThreads = len(backend.Threads)
+
+		maxIdx := -1
+		hashes := map[int]int64{}
+		for i, thread := range backend.Threads {
+			idx := i
+			if thread.Affinity >= 0 {
+				idx = thread.Affinity
+			}
+			if idx > maxIdx {
+				maxIdx = idx
+			}
+			h := seriesFirst(thread.Hashrate)
+			if h > 0 {
+				hashes[idx] = int64(math.Round(h))
+			}
+		}
+		if maxIdx < 0 {
+			return
+		}
+
+		perThreadKH := make([]int64, maxIdx+1)
+		for idx, kh := range hashes {
+			if idx >= 0 && idx < len(perThreadKH) {
+				perThreadKH[idx] = kh
+			}
+		}
+		st.PerGPU_KHs = perThreadKH
+		return
 	}
-	s = strings.TrimPrefix(s, "0x")
-	if s == "" {
-		return 0, false
-	}
-	v, err := strconv.ParseUint(s, 16, 64)
-	if err != nil {
-		return 0, false
-	}
-	return int64(v / 1000), true
 }
 
 func formatDifficulty(diff float64) string {
@@ -3433,74 +3564,32 @@ func formatDifficulty(diff float64) string {
 	return fmt.Sprintf("%.2f %sH", diff, suffixes[idx])
 }
 
-func applyDetail(st *Stat, detail detailSnapshot) {
-	st.Difficulty = detail.Difficulty
-	if len(detail.Sensors) == 0 && len(detail.Hashes) == 0 {
-		return
-	}
-	maxIndex := len(st.PerGPU_KHs)
-	if len(st.Temps) > maxIndex {
-		maxIndex = len(st.Temps)
-	}
-	if len(st.Fans) > maxIndex {
-		maxIndex = len(st.Fans)
-	}
-	if len(st.PerGPU_Power) > maxIndex {
-		maxIndex = len(st.PerGPU_Power)
-	}
-	for idx := range detail.Sensors {
-		if idx+1 > maxIndex {
-			maxIndex = idx + 1
+func seriesFirst(values []*float64) float64 {
+	for _, v := range values {
+		if v != nil {
+			return *v
 		}
 	}
-	for idx := range detail.Hashes {
-		if idx+1 > maxIndex {
-			maxIndex = idx + 1
-		}
-	}
-	if maxIndex == 0 {
-		return
-	}
+	return 0
+}
 
-	hashes := make([]int64, maxIndex)
-	temps := make([]int, maxIndex)
-	fans := make([]int, maxIndex)
-	power := make([]float64, maxIndex)
-	for i := range power {
-		power[i] = -1
+func formatHashrate(hs float64) string {
+	if hs <= 0 {
+		return "—"
 	}
-	copy(hashes, st.PerGPU_KHs)
-	copy(temps, st.Temps)
-	copy(fans, st.Fans)
-	copy(power, st.PerGPU_Power)
-
-	for idx, v := range detail.Hashes {
-		if idx < 0 || idx >= maxIndex {
-			continue
-		}
-		if v > 0 {
-			hashes[idx] = v
-		}
+	units := []string{"H/s", "KH/s", "MH/s", "GH/s", "TH/s"}
+	idx := 0
+	for hs >= 1000 && idx < len(units)-1 {
+		hs /= 1000
+		idx++
 	}
-	for idx, s := range detail.Sensors {
-		if idx < 0 || idx >= maxIndex {
-			continue
-		}
-		if s.Temp > 0 {
-			temps[idx] = s.Temp
-		}
-		if s.Fan > 0 {
-			fans[idx] = s.Fan
-		}
-		if s.Power >= 0 {
-			power[idx] = s.Power
-		}
+	if hs >= 100 {
+		return fmt.Sprintf("%.0f %s", hs, units[idx])
 	}
-
-	st.PerGPU_KHs = hashes
-	st.Temps = temps
-	st.Fans = fans
-	st.PerGPU_Power = power
+	if hs >= 10 {
+		return fmt.Sprintf("%.1f %s", hs, units[idx])
+	}
+	return fmt.Sprintf("%.2f %s", hs, units[idx])
 }
 
 var ansiCSI = regexp.MustCompile(`\x1b\[[0-9;]*[A-Za-z]`)
@@ -3514,7 +3603,6 @@ func sanitizeLogLine(s string) string {
 		s = ansiCSI.ReplaceAllString(s, "")
 	}
 
-	// Fast path: keep common ethminer ASCII logs without extra allocations.
 	asciiSafe := true
 	for i := 0; i < len(s); i++ {
 		b := s[i]
